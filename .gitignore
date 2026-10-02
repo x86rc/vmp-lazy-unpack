@@ -7,7 +7,6 @@ dist/
 scratch/
 output/
 tests/
-catalog/
 *.bin
 *.exe
 *.sys
@@ -18,3 +17,5 @@ catalog/
 *.id2
 *.nam
 *.til
+!/catalog/
+!/catalog/**

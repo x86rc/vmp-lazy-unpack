@@ -3,13 +3,13 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "unpack-resolve-iat"
+name = "vmp-lazy-unpack"
 version = "0.1.0"
 description = ""
 dependencies = ["pefile", "capstone", "unicorn"]
 
 [project.scripts]
-unpack-resolve-iat = "unpack.cli:main"
+vmp-lazy-unpack = "unpack.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["unpack*"]
