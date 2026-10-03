@@ -6,7 +6,8 @@ def repair_exception_tables(data):
     pe = parse_pe(data)
     directory = pe.OPTIONAL_HEADER.DATA_DIRECTORY[3]
     report = {"runtime_functions": 0, "unwind_records": 0, "handlers": 0,
-              "chains": 0, "pdata_restored": 0, "pdata_status": "absent"}
+              "chains": 0, "pdata_restored": 0, "pdata_status": "absent",
+              "prologue_offset_mismatches": 0}
     if not directory.VirtualAddress and not directory.Size:
         return data, report
     if not directory.VirtualAddress or not directory.Size or directory.Size % 12 or directory.VirtualAddress % 4:
@@ -56,7 +57,8 @@ def repair_exception_tables(data):
                 raise ValueError(f"invalid unwind frame register at RVA 0x{unwind:X}")
             codes = read(unwind + 4, ((count + 1) & ~1) * 2) if count else b""
             index = 0
-            previous = prologue
+            previous = 255
+            prologue_mismatch = False
             while index < count:
                 offset, encoded = codes[index * 2:index * 2 + 2]
                 operation, info = encoded & 15, encoded >> 4
@@ -70,7 +72,9 @@ def repair_exception_tables(data):
                     if offset > previous:
                         raise ValueError(f"unordered unwind codes at RVA 0x{unwind:X}")
                     previous = offset
+                    prologue_mismatch |= offset > prologue
                 index += slots
+            report["prologue_offset_mismatches"] += prologue_mismatch
             tail = unwind + 4 + len(codes)
             if flags & 4:
                 _, _, unwind = row(read(tail, 12))

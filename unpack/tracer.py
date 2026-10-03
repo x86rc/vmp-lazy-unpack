@@ -616,9 +616,12 @@ class Tracer:
         self.stop_reason = None
         self.stop_registers = None
         self.module_bases = module_bases
+        self.module_paths = {}
+        self.last_error = 0
         self.export_lookup = export_lookup
         self.heap_cursor = EMU_HEAP_BASE + 0x1000
         self.heap_allocations = {}
+        self.local_allocations = set()
         self.emu_file_size = len(pe.__data__)
         self.files = FileModel(uc, {"sample.exe": bytes(pe.__data__)})
         self.blocks = 0
@@ -731,6 +734,41 @@ class Tracer:
         if address:
             self.uc.mem_write(address, encode_u64(value & 0xFFFFFFFFFFFFFFFF))
 
+    def memory_basic_information(self, address):
+        page = address & -PAGE_SIZE
+        if page >= 1 << 47:
+            return None
+        regions = list(self.uc.mem_regions())
+        region = next((r for r in regions if r[0] <= page <= r[1]), None)
+        if region is None:
+            end = min((r[0] for r in regions if r[0] > page), default=1 << 47)
+            info = bytearray(48)
+            write_u64(info, 0, page)
+            write_u64(info, 24, end - page)
+            write_u32(info, 32, 0x10000)
+            return bytes(info)
+        start, end, permissions = region
+        allocation = start
+        protection = (1, 2, 4, 4, 0x10, 0x20, 0x40, 0x40)[permissions & 7]
+        kind = 0x20000
+        if EMU_HEAP_BASE <= page < EMU_HEAP_BASE + EMU_HEAP_SIZE:
+            allocation, protection = EMU_HEAP_BASE, 4
+        elif self.in_module(page):
+            allocation, kind = self.image_start, 0x1000000
+        elif start in self.module_bases.values() or start == HOST_IMAGE_BASE:
+            kind = 0x1000000
+        elif start in self.files.views:
+            kind = 0x1000000 if self.files.views[start]["image"] else 0x40000
+        info = bytearray(48)
+        write_u64(info, 0, page)
+        write_u64(info, 8, allocation)
+        write_u32(info, 16, protection)
+        write_u64(info, 24, end + 1 - page)
+        write_u32(info, 32, 0x1000)
+        write_u32(info, 36, protection)
+        write_u32(info, 40, kind)
+        return bytes(info)
+
     def emulate_import(self, label):
         module_name, symbol = split_import_label(label)
         symbol_lower = symbol.lower()
@@ -770,6 +808,22 @@ class Tracer:
             requested = normalize_module_name(self.read_utf16(rcx))
             result = self.module_bases.get(requested, 0)
             details["requested_module"] = requested
+        elif symbol_lower == "getmodulefilenamew":
+            path = self.module_paths.get(rcx)
+            capacity = r8 & 0xFFFFFFFF
+            if not capacity:
+                result = 0
+            elif path is None:
+                self.last_error = 126
+                result = 0
+            else:
+                encoded = path.encode("utf-16-le")
+                length = len(encoded) // 2
+                self.uc.mem_write(rdx, encoded[:(capacity - 1) * 2] + b"\0\0")
+                result = length if length < capacity else capacity
+                if length >= capacity:
+                    self.last_error = 122
+                details["module_path"] = path
         elif symbol_lower == "getprocaddress":
             if rdx <= 0xFFFF:
                 requested = int(rdx)
@@ -779,6 +833,27 @@ class Tracer:
             details["requested_export"] = requested
         elif symbol_lower == "getprocessheap":
             result = EMU_HEAP_BASE
+        elif symbol_lower == "localalloc":
+            details.update(allocation_size=int(rdx), allocation_flags=rcx & 0xFFFFFFFF)
+            if rcx & 0xFFFFFFFF & ~0xF70:
+                return None, details
+            try:
+                result = self.heap_allocate(rdx)
+            except MemoryError:
+                self.last_error = 8
+                result = 0
+            if result:
+                self.local_allocations.add(result)
+        elif symbol_lower == "localfree":
+            if not rcx:
+                result = 0
+            elif rcx in self.local_allocations:
+                self.local_allocations.remove(rcx)
+                self.heap_allocations.pop(rcx)
+                result = 0
+            else:
+                self.last_error = 6
+                result = rcx
         elif symbol_lower == "heapalloc":
             result = self.heap_allocate(r8)
             details["allocation_size"] = int(r8)
@@ -797,6 +872,25 @@ class Tracer:
             result = 1
         elif canonical_symbol == "ntprotectvirtualmemory":
             result = 0
+        elif canonical_symbol == "ntqueryvirtualmemory":
+            details.update(memory_address=rdx, information_class=r8 & 0xFFFFFFFF)
+            if r8 & 0xFFFFFFFF:
+                return None, details
+            rsp = self.uc.reg_read(ux.UC_X86_REG_RSP)
+            length = read_u64(self.uc.mem_read(rsp + 0x28, 8))
+            returned = read_u64(self.uc.mem_read(rsp + 0x30, 8))
+            if rcx != 0xFFFFFFFFFFFFFFFF:
+                result = 0xC0000008
+            elif length < 48:
+                result = 0xC0000004
+            else:
+                info = self.memory_basic_information(rdx)
+                if info is None:
+                    result = 0xC000000D
+                else:
+                    self.uc.mem_write(r9, info)
+                    self.write_u64_if_mapped(returned, len(info))
+                    result = 0
         elif canonical_symbol in (
             "ntclose",
             "ntdelayexecution",
@@ -872,8 +966,29 @@ class Tracer:
             result = 0
         elif symbol_lower == "getcurrentprocess":
             result = 0xFFFFFFFFFFFFFFFF
+        elif symbol_lower == "getprocessaffinitymask":
+            if rcx != 0xFFFFFFFFFFFFFFFF:
+                self.last_error = 6
+                result = 0
+            elif not rdx or not r8:
+                self.last_error = 87
+                result = 0
+            else:
+                self.write_u64_if_mapped(rdx, 1)
+                self.write_u64_if_mapped(r8, 1)
+                result = 1
         elif symbol_lower == "getcurrentthread":
             result = 0xFFFFFFFFFFFFFFFE
+        elif symbol_lower in ("setprocessaffinitymask", "setthreadaffinitymask"):
+            handle = 0xFFFFFFFFFFFFFFFF if symbol_lower == "setprocessaffinitymask" else 0xFFFFFFFFFFFFFFFE
+            if rcx != handle:
+                self.last_error = 6
+                result = 0
+            elif rdx != 1:
+                self.last_error = 87
+                result = 0
+            else:
+                result = 1
         elif symbol_lower == "getcurrentprocessid":
             result = 0x1337
         elif symbol_lower == "getcurrentthreadid":
@@ -888,6 +1003,11 @@ class Tracer:
             result = 1
         elif symbol_lower == "gettickcount64":
             result = 0x12345678
+        elif symbol_lower == "sleep":
+            details["milliseconds"] = rcx & 0xFFFFFFFF
+            if details["milliseconds"]:
+                return None, details
+            result = 0
         elif symbol_lower == "getsystemtimeasfiletime":
             self.write_u64_if_mapped(rcx, 0x01D9000000000000)
             result = 0
@@ -900,10 +1020,14 @@ class Tracer:
             "initializecriticalsectionex",
             "releasesrwlockexclusive",
             "acquiresrwlockexclusive",
-            "setlasterror",
         ):
             result = 1
-        elif symbol_lower in ("getlasterror", "isdebuggerpresent"):
+        elif symbol_lower == "setlasterror":
+            self.last_error = rcx & 0xFFFFFFFF
+            result = 0
+        elif symbol_lower == "getlasterror":
+            result = self.last_error
+        elif symbol_lower == "isdebuggerpresent":
             result = 0
         else:
             return None, details
@@ -1185,6 +1309,11 @@ def main():
 
     tracer = Tracer(uc, mapped_start, mapped_end, synthetic_import_targets,
                     pe, module_bases, export_lookup)
+    tracer.module_paths = {base: f"C:\\Windows\\System32\\{name}" for name, base in module_bases.items()}
+    tracer.module_paths[mapped_start] = str(input_path)
+    tracer.module_paths[0] = process_image.path if process_image else "C:\\host.exe"
+    if is_dll:
+        tracer.module_paths[HOST_IMAGE_BASE] = "C:\\host.exe"
     tracer.emu_file_size = len(emu_file_bytes)
     tracer.files.files[input_path.name.lower()] = bytes(pe.__data__)
     tracer.encoded_string_keys = tuple(recover_keys(bytes(pe.__data__)))
