@@ -89,16 +89,18 @@ def capture(output):
     modules, skipped = {}, []
     ntdll = None
     api_sets = {}
-    for path in sorted(system32.glob("*.dll"), key=lambda p: p.name.lower()):
+    paths = sorted(system32.glob("*.dll"), key=lambda p: p.name.lower())
+    for path in paths:
         try:
             data = path.read_bytes()
-            modules[path.name.lower()] = extract_module(data)
+            module = extract_module(data)
             if path.name.lower() == "ntdll.dll":
                 ntdll = data
             elif path.name.lower() == "apisetschema.dll":
                 with pefile.PE(data=data, fast_load=True) as schema:
                     section = next(s for s in schema.sections if s.Name.rstrip(b"\0") == b".apiset")
                     api_sets = parse_api_set(section.get_data())
+            modules[path.name.lower()] = module
         except (OSError, ValueError, pefile.PEFormatError, UnicodeError) as exc:
             skipped.append({"module": path.name, "reason": str(exc)})
     if ntdll is None:
@@ -127,7 +129,6 @@ def find_or_capture_catalog(roots):
     directory = roots[-1] / "catalog"
     if directory.exists():
         raise ValueError(f"Incomplete catalog: {directory}")
-    print("Catalog: build")
     capture(directory)
     return directory
 

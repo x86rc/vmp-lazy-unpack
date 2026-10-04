@@ -7,7 +7,7 @@ def repair_exception_tables(data):
     directory = pe.OPTIONAL_HEADER.DATA_DIRECTORY[3]
     report = {"runtime_functions": 0, "unwind_records": 0, "handlers": 0,
               "chains": 0, "pdata_restored": 0, "pdata_status": "absent",
-              "prologue_offset_mismatches": 0}
+              "prologue_offset_mismatches": 0, "dropped_count": 0, "dropped_entries": []}
     if not directory.VirtualAddress and not directory.Size:
         return data, report
     if not directory.VirtualAddress or not directory.Size or directory.Size % 12 or directory.VirtualAddress % 4:
@@ -20,27 +20,38 @@ def repair_exception_tables(data):
         protected.append((rva, rva + size))
         return data[offset:offset + size]
 
-    def executable(begin, end):
+    def code_range_error(begin, end):
+        if begin >= end:
+            return f"end RVA 0x{end:X} is not greater than the start"
         section = pe.get_section_by_rva(begin)
-        return (section is not None and section.Characteristics & 0x20000000
-                and begin < end <= section.VirtualAddress + max(section.Misc_VirtualSize, section.SizeOfRawData))
+        if section is None:
+            return "start is outside image sections"
+        name = section.Name.rstrip(b'\0').decode('ascii', errors='replace')
+        if not section.Characteristics & 0x20000000:
+            return f"section {name!r} is not executable (characteristics 0x{section.Characteristics:X})"
+        section_end = section.VirtualAddress + max(section.Misc_VirtualSize, section.SizeOfRawData)
+        if end > section_end:
+            return f"end RVA 0x{end:X} exceeds section {name!r} ending at 0x{section_end:X}"
+        return None
 
-    def row(blob, offset=0):
+    def row(blob, offset=0, record_rva=None):
         result = tuple(read_u32(blob, offset + i) for i in (0, 4, 8))
         begin, end, unwind = result
-        if not executable(begin, end) or not unwind or unwind % 4:
-            raise ValueError(f"invalid runtime function at RVA 0x{begin:X}")
+        reason = code_range_error(begin, end)
+        if reason is None and not unwind:
+            reason = "unwind RVA is zero"
+        if reason is None and unwind % 4:
+            reason = f"unwind RVA 0x{unwind:X} is not four-byte aligned"
+        if reason:
+            location = f", record RVA 0x{record_rva:X}" if record_rva is not None else ""
+            raise ValueError(f"invalid runtime function at RVA 0x{begin:X} "
+                             f"(end 0x{end:X}, unwind 0x{unwind:X}{location}): {reason}")
         return result
 
     table = read(directory.VirtualAddress, directory.Size)
-    rows = [row(table, i) for i in range(0, len(table), 12)]
-    ordered = sorted(rows)
-    overlaps = sum(left[1] > right[0] for left, right in zip(ordered, ordered[1:]))
-    if overlaps and rows != ordered:
-        raise ValueError("cannot reorder overlapping runtime functions")
-    report["overlapping_ranges"] = overlaps
     visited = set()
-    for _, _, root in rows:
+
+    def validate_chain(root):
         unwind = root
         path = set()
         while unwind not in visited:
@@ -77,26 +88,59 @@ def repair_exception_tables(data):
             report["prologue_offset_mismatches"] += prologue_mismatch
             tail = unwind + 4 + len(codes)
             if flags & 4:
-                _, _, unwind = row(read(tail, 12))
+                _, _, unwind = row(read(tail, 12), record_rva=tail)
                 report["chains"] += 1
             else:
                 if flags & 3:
                     handler = read_u32(read(tail, 4))
-                    if not executable(handler, handler + 1):
-                        raise ValueError(f"invalid exception handler RVA 0x{handler:X}")
+                    reason = code_range_error(handler, handler + 1)
+                    if reason:
+                        raise ValueError(f"invalid exception handler RVA 0x{handler:X} "
+                                         f"(unwind RVA 0x{unwind:X}): {reason}")
                     handler_section = pe.get_section_by_rva(tail)
                     protected.append((tail, handler_section.VirtualAddress + max(
                         handler_section.Misc_VirtualSize, handler_section.SizeOfRawData)))
                     report["handlers"] += 1
                 break
+        return path
+
+    rows = []
+    for offset in range(0, len(table), 12):
+        counts = {key: report[key] for key in ('chains', 'handlers', 'prologue_offset_mismatches')}
+        try:
+            entry = row(table, offset, directory.VirtualAddress + offset)
+            path = validate_chain(entry[2])
+        except ValueError as exc:
+            report.update(counts)
+            report['dropped_entries'].append({
+                'record_rva': directory.VirtualAddress + offset,
+                'begin_rva': read_u32(table, offset),
+                'end_rva': read_u32(table, offset + 4),
+                'unwind_rva': read_u32(table, offset + 8),
+                'error': str(exc),
+            })
+            continue
+        rows.append(entry)
         visited.update(path)
+
+    ordered = sorted(rows)
+    overlaps = sum(left[1] > right[0] for left, right in zip(ordered, ordered[1:]))
+    if overlaps and rows != ordered:
+        raise ValueError("cannot reorder overlapping runtime functions")
+    report['overlapping_ranges'] = overlaps
+    report['dropped_count'] = len(report['dropped_entries'])
 
     output = bytearray(data)
     table_offset = file_offset(pe, directory.VirtualAddress, directory.Size)
-    output[table_offset:table_offset + len(table)] = b"".join(
-        encode_u32(value) for entry in ordered for value in entry)
+    packed = b"".join(encode_u32(value) for entry in ordered for value in entry)
+    output[table_offset:table_offset + len(packed)] = packed
+    write_u32(output, directory.get_field_absolute_offset('Size'), len(packed))
+    if not ordered:
+        write_u32(output, directory.get_field_absolute_offset('VirtualAddress'), 0)
+    if report['dropped_count']:
+        report['status'] = 'filtered' if ordered else 'cleared'
     report.update(runtime_functions=len(rows), unwind_records=len(visited),
-                  table_sorted=rows != ordered, directory_rva=directory.VirtualAddress)
+                  table_sorted=rows != ordered, directory_rva=directory.VirtualAddress if ordered else 0)
     candidates = [s for s in pe.sections if s.Name.rstrip(b"\0") == b".pdata"]
     for section in candidates:
         start, size = section.VirtualAddress, section.Misc_VirtualSize

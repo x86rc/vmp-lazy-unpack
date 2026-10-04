@@ -1,4 +1,4 @@
-# vmp-lazy-unpack
+# vmp-lazy-unpack<br>[![@x86rc](https://img.shields.io/badge/%40x86rc-000000?style=flat&logo=x&logoColor=white)](https://x.com/x86rc)
 
 An emulation-based unpacker and import resolver for Windows x64 VMProtect 3.x binaries.
 
@@ -23,6 +23,8 @@ py -m pip install -e .
 
 Installs `pefile`, `capstone`, and `unicorn`.
 
+The optional C extension builds automatically during installation. Install Microsoft C++ Build Tools first to enable it on Windows; otherwise Python hooks are used.
+
 ## Usage
 
 ```powershell
@@ -34,3 +36,12 @@ py -m unpack "C:\path\file.exe"
 - Only supports Windows x64. Tested against VMProtect 3.4, 3.9, and 3.10.
 - This will not devirtualize code.
 - This will not resolve external calls inside virtualized functions automatically. These recovered imports are included in IAT for later lifting.
+
+---
+
+<p align="center">
+  Want to chat about deobfuscation or reverse engineering?<br><br>
+  <a href="https://discord.gg/Dvcj2qQVsg">
+    <img src="https://img.shields.io/badge/Find%20us%20here%20too-5865F2?style=for-the-badge&amp;logo=discord&amp;logoColor=white" alt="Find us here too">
+  </a>
+</p>

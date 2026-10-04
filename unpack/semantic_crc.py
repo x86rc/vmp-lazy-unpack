@@ -24,6 +24,9 @@ def condition(name, flags):
               "b": cf, "c": cf, "ae": None if cf is None else not cf,
               "nb": None if cf is None else not cf, "o": of, "no": None if of is None else not of,
               "p": pf, "pe": pf, "np": None if pf is None else not pf}
+    below_or_equal = True if cf is True or zf is True else False if cf is False and zf is False else None
+    simple['be'] = below_or_equal
+    simple['a'] = None if below_or_equal is None else not below_or_equal
     return simple.get(name)
 
 
@@ -46,6 +49,31 @@ def scratch_operation(ins, md, stack, memory, flags):
         result = int(known) if known is not None else None
     elif name == "not":
         result = value ^ mask if value is not None else None
+    elif name in ('shl', 'sal', 'shr', 'sar'):
+        count = immediate & (63 if bits == 64 else 31)
+        if count == 0:
+            result = value
+        else:
+            flags.update({key: None for key in ('sf', 'zf', 'of', 'cf', 'pf')})
+            if value is not None:
+                if name in ('shl', 'sal'):
+                    result = (value << count) & mask
+                    if count < bits:
+                        flags['cf'] = bool((value >> (bits - count)) & 1)
+                elif name == 'shr':
+                    result = value >> count
+                    if count < bits:
+                        flags['cf'] = bool((value >> (count - 1)) & 1)
+                else:
+                    signed = value - (1 << bits) if value & sign else value
+                    result = (signed >> count) & mask
+                    if count < bits:
+                        flags['cf'] = bool((value >> (count - 1)) & 1)
+                flags['sf'], flags['zf'] = bool(result & sign), result == 0
+                flags['pf'] = (result & 255).bit_count() % 2 == 0
+                if count == 1:
+                    flags['of'] = (bool(result & sign) ^ flags['cf'] if name in ('shl', 'sal')
+                                   else bool(value & sign) if name == 'shr' else False)
     elif name in ("inc", "dec", "add", "sub", "neg", "xor", "and", "or"):
         carry = flags.get("cf")
         flags.update({key: None for key in ("sf", "zf", "of", "cf", "pf")})
@@ -91,6 +119,23 @@ def recognize_loop(raw, address):
     instructions = list(md.disasm(raw, address))
     if not instructions or sum(ins.size for ins in instructions) != len(raw):
         return None
+    return recognize_instructions(instructions, address, md)
+
+
+def instruction_ranges(instructions):
+    ranges = []
+    for ins in instructions:
+        if ranges and ranges[-1][0] + len(ranges[-1][1]) == ins.address:
+            start, raw = ranges[-1]
+            ranges[-1] = (start, raw + bytes(ins.bytes))
+        else:
+            ranges.append((ins.address, bytes(ins.bytes)))
+    return ranges
+
+
+def recognize_instructions(instructions, address, md):
+    if not instructions:
+        return None
     last = instructions[-1]
     if last.mnemonic != "jne" or len(last.operands) != 1 or last.operands[0].type != X86_OP_IMM or last.operands[0].imm != address:
         return None
@@ -129,12 +174,16 @@ def recognize_loop(raw, address):
         if index in skip:
             continue
         ops = ins.operands
+        if (ins.mnemonic == 'jmp' and len(ops) == 1 and ops[0].type == X86_OP_IMM
+                and ops[0].imm == instructions[index + 1].address):
+            continue
         if ins.mnemonic.startswith("j") and len(ops) == 1 and ops[0].type == X86_OP_IMM and ops[0].imm == ins.address + ins.size:
             continue
         if ins.mnemonic.startswith("j") and len(ops) == 1 and ops[0].type == X86_OP_IMM and condition(ins.mnemonic, flags) is False:
             branch_proofs.append({"address": ins.address, "target": ops[0].imm, "condition": ins.mnemonic, "taken": False})
             continue
-        if ins.mnemonic == "call" and len(ops) == 1 and ops[0].type == X86_OP_IMM and ops[0].imm == ins.address + ins.size:
+        if (ins.mnemonic == "call" and len(ops) == 1 and ops[0].type == X86_OP_IMM
+                and ops[0].imm == instructions[index + 1].address):
             stack -= 8
             depth = max(depth, -stack)
             for byte in range(8):
@@ -238,26 +287,70 @@ def recognize_loop(raw, address):
         return None
     if len(key_op.operands) != 2 or reg(key_op.operands[0]) != crc or key_op.operands[1].type != X86_OP_IMM:
         return None
-    return {"bytes": raw, "state_xor": key_op.operands[1].imm & 0xffffffff,
+    return {"bytes": b''.join(bytes(ins.bytes) for ins in instructions),
+            "code_ranges": instruction_ranges(instructions),
+            "state_xor": key_op.operands[1].imm & 0xffffffff,
             "kind": "semantic_crc", "registers": {"source": source, "count": count, "table": table, "crc": crc},
             "stack_depth": depth, "proof_address": address, "branch_proofs": branch_proofs}
 
 
+def recognize_scattered_loop(data, start, tail, base, md=None):
+    if md is None:
+        md = Cs(CS_ARCH_X86, CS_MODE_64)
+        md.detail = True
+    instructions = []
+    covered = set()
+    offset = start
+    allowed = PREFIX_OPS | {'movzx', 'lea', 'push', 'pop', 'call', 'nop'}
+    for _ in range(512):
+        if not 0 <= offset < len(data) or offset in covered:
+            return None
+        ins = next(md.disasm(data[offset:offset + 15], base + offset, count=1), None)
+        if ins is None:
+            return None
+        span = set(range(offset, offset + ins.size))
+        if covered & span:
+            return None
+        covered.update(span)
+        instructions.append(ins)
+        if offset == tail:
+            return recognize_instructions(instructions, base + start, md)
+        if ins.mnemonic in ('jmp', 'call'):
+            if len(ins.operands) != 1 or ins.operands[0].type != X86_OP_IMM:
+                return None
+            offset = ins.operands[0].imm - base
+            continue
+        if not (ins.mnemonic in allowed or ins.mnemonic.startswith(('j', 'set'))):
+            return None
+        offset += ins.size
+    return None
+
+
 def discover_semantic_crc_loops(pe):
     result = {}
+    md = Cs(CS_ARCH_X86, CS_MODE_64)
+    md.detail = True
     for section in pe.sections:
         if not section.Characteristics & 0x20000000:
             continue
         data = section.get_data()
-        offset = 0
-        while (offset := data.find(b"\x0f\x85", offset)) >= 0:
-            if offset + 6 <= len(data):
-                displacement = read_i32(data, offset + 2)
-                start = offset + 6 + displacement
-                if 0 <= start < offset and 25 <= -displacement <= 512:
+        base = pe.OPTIONAL_HEADER.ImageBase + section.VirtualAddress
+        for opcode, size in ((b'\x0f\x85', 6), (b'\x75', 2)):
+            offset = 0
+            while (offset := data.find(opcode, offset)) >= 0:
+                if offset + size <= len(data):
+                    displacement = (read_i32(data, offset + 2) if size == 6 else
+                                    int.from_bytes(data[offset + 1:offset + 2], 'little', signed=True))
+                    start = offset + size + displacement
+                    if not 0 <= start < len(data) or start == offset:
+                        offset += 1
+                        continue
                     address = pe.OPTIONAL_HEADER.ImageBase + section.VirtualAddress + start
-                    candidate = recognize_loop(data[start:offset + 6], address)
+                    candidate = (recognize_loop(data[start:offset + size], address)
+                                 if 0 < offset - start <= 512 else None)
+                    if candidate is None:
+                        candidate = recognize_scattered_loop(data, start, offset, base, md)
                     if candidate:
                         result[address] = candidate
-            offset += 1
+                offset += 1
     return result

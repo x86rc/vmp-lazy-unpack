@@ -31,7 +31,7 @@ HEX_FIELDS = frozenset((
     'memory_address', 'peb_offset', 'syscall_number', 'state_xor', 'string_key',
     'encoded_value', 'old_value', 'new_value', 'table', 'handle', 'file_handle', 'section_handle', 'value',
     'allocation', 'protection', 'status', 'section_attributes', 'view',
-    'written_destination_pages', 'decoder_candidates',
+    'written_destination_pages',
 ))
 REGISTER_FIELDS = frozenset((
     'rax', 'rbx', 'rcx', 'rdx', 'rsi', 'rdi', 'rbp', 'rsp',

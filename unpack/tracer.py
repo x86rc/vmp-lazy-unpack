@@ -2,7 +2,9 @@ import argparse
 import hashlib
 import json
 import struct
-from collections import Counter
+import time
+from collections import Counter, deque
+from contextlib import nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -17,9 +19,12 @@ from .dump import dump_pe
 from .reconstruct import reconstruct_imports
 from .loader_crc import discover_crc_loops, accelerate_crc
 from .file_model import FileModel
-from .lzma_adapter import DecoderAccelerator
 from .encoded_imports import recover_encoded_imports
 from .discover import recover_keys
+from .progress import watch_run, log_line
+from .diagnostics import Diagnostics
+from .hooks import TraceHooks
+from .single_step import SingleStep
 from .records import ModuleImage, ImportWrite, Event, format_report
 from .pe import (write_pe_structure, memory_image, IMAGE_FILE_HEADER, IMAGE_EXPORT_DIRECTORY,
                  IMAGE_DATA_DIRECTORY, IMAGE_OPTIONAL_HEADER64, IMAGE_SECTION_HEADER)
@@ -138,7 +143,7 @@ def collect_imports(pe):
     for descriptor in getattr(pe, "DIRECTORY_ENTRY_IMPORT", []):
         dll = descriptor.dll.decode("ascii", errors="replace")
         for imported in descriptor.imports:
-            if imported.name:
+            if not imported.import_by_ordinal:
                 symbol = imported.name.decode("ascii", errors="replace")
             else:
                 symbol = f"ordinal_{imported.ordinal}"
@@ -606,10 +611,24 @@ def map_synthetic_process_state(uc, module_bases, process_image=None):
 
 class Tracer:
     def __init__(self, uc, image_start, image_end, synthetic_import_targets,
-                 pe, module_bases, export_lookup):
+                 pe, module_bases, export_lookup, progress=None, diagnostics=None):
         self.uc = uc
+        self.progress = progress
+        self.diagnostics = diagnostics
+        self.last_progress_time = time.monotonic()
+        self.recent_blocks = deque(maxlen=32)
+        self.ordinary_blocks = set()
+        self.entry_address = image_start + pe.OPTIONAL_HEADER.AddressOfEntryPoint
+        self.section_headers = {
+            image_start + section.VirtualAddress: {
+                "raw_size": section.SizeOfRawData,
+                "raw_offset": section.PointerToRawData,
+                "virtual_size": section.Misc_VirtualSize,
+            } for section in pe.sections
+        }
         self.image_start = image_start
         self.image_end = image_end
+        self.single_step = SingleStep(self, pe)
         self.synthetic_import_targets = synthetic_import_targets
         self.events = []
         self.instructions = 0
@@ -618,6 +637,7 @@ class Tracer:
         self.module_bases = module_bases
         self.module_paths = {}
         self.last_error = 0
+        self.thread_hidden_from_debugger = False
         self.export_lookup = export_lookup
         self.heap_cursor = EMU_HEAP_BASE + 0x1000
         self.heap_allocations = {}
@@ -625,6 +645,8 @@ class Tracer:
         self.emu_file_size = len(pe.__data__)
         self.files = FileModel(uc, {"sample.exe": bytes(pe.__data__)})
         self.blocks = 0
+        self.block_counter = None
+        self.hook_statistics = {}
         self.crc_accelerations = []
         self.resolved_import_writes = {}
         self.resolved_write_count = 0
@@ -633,15 +655,30 @@ class Tracer:
         self.stack_copy_count = 0
         self.stack_copy_bytes = 0
         self.stack_copy_candidates = set()
+        if progress:
+            progress("Discovering CRC loops")
         self.discovered_crc_loops = discover_crc_loops(pe)
-        self.decompressors = DecoderAccelerator(pe)
-        self.decompressions = []
         for section in pe.sections:
             raw = section.get_data()
             cursor = 0
             while (cursor := raw.find(b"\xf3\xa4", cursor)) >= 0:
                 self.stack_copy_candidates.add(image_start + section.VirtualAddress + cursor)
                 cursor += 1
+
+        discovery = {
+            "crc_candidates": [{"address": address, "kind": candidate.get('kind', 'crc')}
+                               for address, candidate in self.discovered_crc_loops.items()],
+            "stack_copy_candidates": sorted(self.stack_copy_candidates),
+        }
+        if diagnostics:
+            diagnostics.record('accelerator_discovery', **discovery)
+            for address, candidate in self.discovered_crc_loops.items():
+                ranges = candidate.get('code_ranges', [(address, candidate['bytes'])])
+                diagnostics.register_candidate('crc', address,
+                                               [(start, start + len(raw)) for start, raw in ranges])
+        if progress:
+            progress(f"crc {len(self.discovered_crc_loops)} "
+                     f"stack copies {len(self.stack_copy_candidates)}")
 
         sections = sorted(pe.sections, key=lambda section: section.VirtualAddress)
         self.image_section_ranges = []
@@ -665,15 +702,28 @@ class Tracer:
     def in_module(self, address):
         return self.image_start <= address < self.image_end
 
+    def sync_counts(self):
+        if self.block_counter is not None:
+            self.blocks = self.block_counter()
+            self.instructions = self.blocks
+
     def add_event(self, kind, address, **details):
+        self.sync_counts()
         event = Event(kind, address, self.instructions, details)
         self.events.append(event)
+        if self.diagnostics:
+            self.diagnostics.record('event', event=event)
         return event
 
     def stop_event(self, event):
         self.stop_reason = event
         self.stop_registers = register_state(self.uc)
         self.uc.emu_stop()
+        if self.diagnostics:
+            self.diagnostics.checkpoint(self.uc, blocks=self.blocks, stop_reason=event,
+                                        recent_blocks=list(self.recent_blocks))
+        if self.progress:
+            self.progress(f"stop {event.kind}")
 
     def stop(self, kind, address, **details):
         self.stop_event(self.add_event(kind, address, **details))
@@ -891,8 +941,23 @@ class Tracer:
                     self.uc.mem_write(r9, info)
                     self.write_u64_if_mapped(returned, len(info))
                     result = 0
+        elif canonical_symbol == "ntsetinformationthread" and (rdx & 0xFFFFFFFF) == 17:
+            details.update(handle=rcx, information_class=17, input_address=r8, input_length=r9)
+            if (r9 & 0xFFFFFFFF) != 0:
+                result = 0xC0000004
+            elif rcx != 0xFFFFFFFFFFFFFFFE:
+                result = 0xC0000008
+            else:
+                self.thread_hidden_from_debugger = True
+                result = 0
+        elif canonical_symbol == "ntclose":
+            details.update(handle=rcx, known_handle=rcx in self.files.handles)
+            if rcx in self.files.handles:
+                del self.files.handles[rcx]
+                result = 0
+            else:
+                result = 0xC0000008
         elif canonical_symbol in (
-            "ntclose",
             "ntdelayexecution",
             "ntsetinformationprocess",
             "ntsetinformationthread",
@@ -945,6 +1010,8 @@ class Tracer:
             self.write_u64_if_mapped(size_pointer, view_size)
             details["view"] = view
             details.update(self.files.views[view])
+            if self.diagnostics:
+                self.diagnostics.watch_mapping(self.uc, view, view_size, self.files.views[view]['name'])
             result = 0
         elif canonical_symbol == "ntunmapviewofsection":
             result = 0
@@ -954,11 +1021,58 @@ class Tracer:
             "ntqueryinformationprocess",
             "ntqueryinformationthread",
         ):
-            if r8 and r9:
-                self.uc.mem_write(r8, b"\x00" * min(int(r9), 0x1000))
-                if canonical_symbol == "ntqueryinformationprocess" and rdx == 31:
-                    self.write_u32_if_mapped(r8, 1)
+            details.update(handle=rcx, information_class=rdx & 0xFFFFFFFF,
+                           output_address=r8, output_length=r9)
+
+            def capture(name, address, size):
+                if address and size:
+                    try:
+                        details[name] = bytes(self.uc.mem_read(address, size)).hex()
+                    except UcError as exc:
+                        details[name + "_error"] = str(exc)
+
+            return_length = 0
+            try:
+                rsp = self.uc.reg_read(ux.UC_X86_REG_RSP)
+                return_length = read_u64(self.uc.mem_read(rsp + 0x28, 8))
+                details["return_length_address"] = return_length
+            except UcError as exc:
+                details["return_length_address_error"] = str(exc)
+            capture("output_before", r8, min(int(r9), 64))
+            capture("return_length_before", return_length, 4)
             result = 0
+            information_class = rdx & 0xFFFFFFFF
+            if canonical_symbol == "ntqueryinformationprocess" and information_class in (7, 30, 31):
+                required = 4 if information_class == 31 else 8
+                if (r9 & 0xFFFFFFFF) != required:
+                    result = 0xC0000004
+                elif rcx != 0xFFFFFFFFFFFFFFFF:
+                    result = 0xC0000008
+                else:
+                    try:
+                        self.uc.mem_write(r8, int(information_class == 31).to_bytes(required, 'little'))
+                        if return_length:
+                            self.uc.mem_write(return_length, required.to_bytes(4, 'little'))
+                        if information_class == 30:
+                            result = 0xC0000353
+                    except UcError:
+                        result = 0xC0000005
+            elif canonical_symbol == "ntqueryinformationthread" and information_class == 17:
+                if (r9 & 0xFFFFFFFF) != 1:
+                    result = 0xC0000004
+                elif rcx != 0xFFFFFFFFFFFFFFFE:
+                    result = 0xC0000008
+                else:
+                    try:
+                        self.uc.mem_write(r8, bytes([self.thread_hidden_from_debugger]))
+                        if return_length:
+                            self.uc.mem_write(return_length, (1).to_bytes(4, 'little'))
+                    except UcError:
+                        result = 0xC0000005
+            elif r8 and r9:
+                self.uc.mem_write(r8, b"\x00" * min(int(r9), 0x1000))
+            capture("output_after", r8, min(int(r9), 64))
+            capture("return_length_after", return_length, 4)
         elif canonical_symbol == "ntquerysysteminformation":
             if rdx and r8:
                 self.uc.mem_write(rdx, b"\x00" * min(int(r8), 0x1000))
@@ -1035,24 +1149,49 @@ class Tracer:
 
 
     def on_block(self, uc, address, size, user_data):
-        self.blocks += 1
+        if self.block_counter is None:
+            self.blocks += 1
+        else:
+            self.blocks = self.block_counter()
         self.instructions = self.blocks
+        if (self.single_step.active and
+                self.synthetic_import_targets.get(address, '').lower().endswith('!rtlunwindex')):
+            self.single_step.unwind()
+            return
+        if self.single_step.on_block(address):
+            return
+        if self.diagnostics:
+            self.diagnostics.observe_block(address, size)
+        if self.diagnostics:
+            self.recent_blocks.append(hex(address))
+            if self.blocks % 16384 == 0:
+                now = time.monotonic()
+                if now - self.last_progress_time >= 2:
+                    self.last_progress_time = now
+                    report = {
+                        "blocks": self.blocks,
+                        "address": address,
+                        "recent_blocks": list(self.recent_blocks),
+                        "written_page_count": len(self.written_destination_pages),
+                        "resolved_import_writes": self.resolved_write_count,
+                        "crc_accelerations": len(self.crc_accelerations),
+                        "recent_events": self.events[-4:],
+                        "registers": register_state(uc),
+                    }
+                    if self.progress:
+                        self.progress(f"blocks {self.blocks}")
+                    if self.diagnostics:
+                        self.diagnostics.checkpoint(uc, **report)
+        if self.blocks == 1 and self.progress:
+            self.progress(f"first block 0x{address:x}")
 
+        if address in self.ordinary_blocks:
+            return
 
         if self.check_restored_entry(address):
             return
         if address in self.stack_copy_candidates and self.try_stack_copy(address):
             return
-        if address in self.decompressors.candidates:
-            details, reason = self.decompressors.try_decode(
-                uc, address, self.image_start, self.image_end, self.packed_destination_ranges)
-            if reason:
-                self.add_event("lzma_fallback", address, reason=reason)
-            if details is not None:
-                self.on_image_write(uc, 0, details["destination"], details["uncompressed_size"], 0, None)
-                self.decompressions.append(details)
-                self.add_event("lzma_accelerated", address, **details)
-                return
         if address in self.discovered_crc_loops:
             try:
                 details = accelerate_crc(uc, address, self.discovered_crc_loops[address], self.image_start, self.image_end,
@@ -1067,6 +1206,7 @@ class Tracer:
 
         label = self.synthetic_import_targets.get(address)
         if label is not None:
+            arguments = self.diagnostics.api_enter(uc, label, self.blocks) if self.diagnostics else None
             try:
                 result, details = self.emulate_import(label)
             except Exception as error:
@@ -1074,6 +1214,8 @@ class Tracer:
                     "import_stub_error", address, import_name=label, error=str(error)
                 )
                 return
+            if self.diagnostics:
+                self.diagnostics.api_return(uc, label, arguments, result, details, self.blocks)
             if result is None:
                 self.stop(
                     "guest_hard_error" if details.get("guest_hard_error") else "unknown_import",
@@ -1104,11 +1246,22 @@ class Tracer:
 
         if not self.in_module(address):
             self.stop("module_exit", address, target=address)
+            return
+
+
+        if (len(self.ordinary_blocks) < 32768
+                and address not in self.stack_copy_candidates
+                and address not in self.discovered_crc_loops):
+            self.ordinary_blocks.add(address)
 
     def on_syscall_instruction(self, uc, user_data):
         address = uc.reg_read(ux.UC_X86_REG_RIP)
         syscall_number = uc.reg_read(ux.UC_X86_REG_RAX)
         syscall_names = self.syscall_catalog.get(syscall_number, [])
+        if self.diagnostics:
+            self.diagnostics.record('syscall_enter', syscall_number=syscall_number,
+                                    syscall_names=syscall_names, blocks=self.blocks,
+                                    **self.diagnostics.snapshot(uc))
         self.add_event(
             "syscall",
             address,
@@ -1131,6 +1284,9 @@ class Tracer:
         uc.reg_write(ux.UC_X86_REG_RAX, 0)
         uc.reg_write(ux.UC_X86_REG_RCX, address + 2)
         uc.reg_write(ux.UC_X86_REG_R11, rflags)
+        if self.diagnostics:
+            self.diagnostics.record('syscall_return', syscall_number=syscall_number,
+                                    blocks=self.blocks, **self.diagnostics.snapshot(uc))
 
     def on_peb_read(self, uc, access, address, size, value, user_data):
         rip = uc.reg_read(ux.UC_X86_REG_RIP)
@@ -1149,6 +1305,7 @@ class Tracer:
 
 
     def on_image_write(self, uc, access, address, size, value, user_data):
+        self.sync_counts()
         for start, end, _ in self.packed_destination_ranges:
             left, right = max(start, address), min(end, address + size)
             if left < right:
@@ -1170,7 +1327,16 @@ class Tracer:
             if start <= address < end:
                 observed = address // PAGE_SIZE in self.written_destination_pages
                 self.stop("restored_code_entry" if observed else "unrestored_code_entry",
-                          address, section=name, observed_write=observed)
+                          address, section=name, observed_write=observed,
+                          reason=("Execution reached a page written during emulation in a section with no raw data."
+                                  if observed else
+                                  "Execution reached an unwritten page in a section with no raw data."),
+                          at_pe_entry=address == self.entry_address,
+                          first_block=self.blocks == 1,
+                          block_count=self.blocks,
+                          section_start=hex(start), section_end=hex(end),
+                          section_header=self.section_headers.get(start),
+                          written_page_count=len(self.written_destination_pages))
                 return True
         return False
 
@@ -1248,46 +1414,72 @@ def final_output_path(input_path, output_name=None, directory=None):
     return path
 
 
+class LogArgumentParser(argparse.ArgumentParser):
+    def error(self, message):
+        self.exit(2, log_line(message) + "\n")
+
+
 def build_argument_parser():
-    parser = argparse.ArgumentParser(prog="python -m unpack", add_help=False, allow_abbrev=False)
+    parser = LogArgumentParser(prog="python -m unpack", add_help=False, allow_abbrev=False)
     parser.add_argument("pe", type=Path)
     parser.add_argument("output_name", nargs="?")
+    parser.add_argument("--diagnostics", action="store_true")
     return parser
 
 
 def main():
-    global ACTIVE_CATALOG
     args = build_argument_parser().parse_args()
     try:
         input_path = args.pe.resolve(strict=True)
         final_path = final_output_path(input_path, args.output_name)
+    except (ValueError, OSError) as exc:
+        raise SystemExit(log_line(exc)) from exc
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    output_dir = Path.cwd() / "scratch" / f"trace_{timestamp}"
+    output_dir.mkdir(parents=True, exist_ok=False)
+    diagnostic_context = Diagnostics(output_dir) if args.diagnostics else nullcontext(None)
+    with watch_run(output_dir) as progress, diagnostic_context as diagnostics:
+        run(input_path, final_path, output_dir, progress, diagnostics)
+
+
+def run(input_path, final_path, output_dir, progress, diagnostics=None):
+    global ACTIVE_CATALOG
+    progress("Loading Windows catalog")
+    try:
         catalog_path = find_or_capture_catalog((Path.cwd(), Path(__file__).resolve().parent.parent))
         ACTIVE_CATALOG = Catalog(catalog_path)
     except (ValueError, OSError) as exc:
-        raise SystemExit(str(exc)) from exc
+        raise SystemExit(log_line(exc)) from exc
 
-    pe = pefile.PE(str(input_path), fast_load=False)
+    progress("Parsing PE")
+    input_bytes = input_path.read_bytes()
+    pe = pefile.PE(data=input_bytes, fast_load=False)
     if pe.FILE_HEADER.Machine != pefile.MACHINE_TYPE["IMAGE_FILE_MACHINE_AMD64"]:
-        raise SystemExit("Expected AMD64 PE")
+        raise SystemExit("expected amd64 pe")
     if pe.OPTIONAL_HEADER.Magic != 0x20B:
-        raise SystemExit("Expected PE32+")
+        raise SystemExit("expected pe32 plus")
     pe.parse_data_directories(directories=[pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_IMPORT"]])
     is_dll = bool(pe.FILE_HEADER.Characteristics & 0x2000)
-    input_sha256 = hashlib.sha256(input_path.read_bytes()).hexdigest()
+    input_sha256 = hashlib.sha256(input_bytes).hexdigest()
+    if diagnostics:
+        diagnostics.record('input', path=str(input_path), sha256=input_sha256,
+                           catalog_sha256=require_catalog().sha256)
     image_base = pe.OPTIONAL_HEADER.ImageBase
     entry = image_base + pe.OPTIONAL_HEADER.AddressOfEntryPoint
     image_end = image_base + align_up(pe.OPTIONAL_HEADER.SizeOfImage)
     if not image_base <= entry < image_end:
-        raise SystemExit(f"Entry VA outside image: 0x{entry:X}")
+        raise SystemExit("entry outside image")
+    tls = getattr(pe, "DIRECTORY_ENTRY_TLS", None)
+    tls_callbacks = tls.struct.AddressOfCallBacks if tls else 0
+    progress(f"entry 0x{entry:x}")
 
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    output_dir = Path.cwd() / "scratch" / f"trace_{timestamp}"
-    output_dir.mkdir(parents=True, exist_ok=False)
+    progress("Collecting imports and syscall candidates")
     import_slots = collect_imports(pe)
     candidates = raw_syscall_candidates(pe)
     (output_dir / "raw_syscall_candidates.json").write_text(
         json.dumps([f"0x{address:X}" for address in candidates], indent=2), encoding="ascii")
 
+    progress("Mapping image and Windows environment")
     uc = Uc(UC_ARCH_X86, UC_MODE_64)
     mapped_start, mapped_end = map_pe(uc, pe)
     clean_ntdll = pefile.PE(data=require_catalog().ntdll_bytes, fast_load=False)
@@ -1308,7 +1500,12 @@ def main():
     uc.reg_write(ux.UC_X86_REG_RIP, entry)
 
     tracer = Tracer(uc, mapped_start, mapped_end, synthetic_import_targets,
-                    pe, module_bases, export_lookup)
+                    pe, module_bases, export_lookup, progress=progress, diagnostics=diagnostics)
+    if diagnostics:
+        diagnostics.watch_mapping(uc, EMU_FILE_VIEW_BASE, len(emu_file_bytes), 'initial ntdll.dll image')
+        if 'ntdll.dll' in module_bases:
+            diagnostics.watch_mapping(uc, module_bases['ntdll.dll'], EMU_MODULE_SIZE, 'loaded ntdll.dll')
+        diagnostics.watch_mapping(uc, KUSER_SHARED_DATA_BASE, PAGE_SIZE, 'KUSER_SHARED_DATA')
     tracer.module_paths = {base: f"C:\\Windows\\System32\\{name}" for name, base in module_bases.items()}
     tracer.module_paths[mapped_start] = str(input_path)
     tracer.module_paths[0] = process_image.path if process_image else "C:\\host.exe"
@@ -1316,24 +1513,57 @@ def main():
         tracer.module_paths[HOST_IMAGE_BASE] = "C:\\host.exe"
     tracer.emu_file_size = len(emu_file_bytes)
     tracer.files.files[input_path.name.lower()] = bytes(pe.__data__)
+    progress("Recovering encoded string keys")
     tracer.encoded_string_keys = tuple(recover_keys(bytes(pe.__data__)))
     tracer.files.files["ntdll.dll"] = require_catalog().ntdll_bytes
     tracer.syscall_catalog = load_system_syscall_catalog()
-    uc.hook_add(UC_HOOK_BLOCK, tracer.on_block)
-    uc.hook_add(UC_HOOK_INSN, tracer.on_syscall_instruction, None, 1, 0, ux.UC_X86_INS_SYSCALL)
-    uc.hook_add(UC_HOOK_MEM_INVALID, tracer.on_invalid_memory)
-    uc.hook_add(UC_HOOK_MEM_WRITE, tracer.on_image_write, begin=mapped_start, end=mapped_end - 1)
-    uc.hook_add(UC_HOOK_MEM_READ, tracer.on_peb_read, begin=PEB_BASE, end=PEB_BASE + PAGE_SIZE - 1)
     error = None
-    try:
-        uc.emu_start(entry, 0)
-    except KeyboardInterrupt:
-        error = "interrupted"
-    except UcError as exc:
-        error = str(exc)
+    progress("Emulating unpacker")
+    if diagnostics:
+        diagnostics.checkpoint(uc, blocks=0, entry=entry)
+    with TraceHooks(tracer, PEB_BASE, PAGE_SIZE) as hooks:
+        progress(f"Hook backend: {hooks.backend}")
+        if hooks.backend == 'python':
+            print('using python hooks')
+        try:
+            uc.emu_start(entry, 0)
+        except KeyboardInterrupt:
+            error = "interrupted"
+        except UcError as exc:
+            error = str(exc)
 
+    if diagnostics:
+        diagnostics.checkpoint(uc, blocks=tracer.blocks, stop_reason=tracer.stop_reason,
+                               error=error, recent_blocks=list(tracer.recent_blocks))
+    execution = {
+        "stop_reason": tracer.stop_reason,
+        "error": error,
+        "blocks": tracer.blocks,
+        "hooks": tracer.hook_statistics,
+        "registers": register_state(uc),
+        "written_destination_pages": sorted(tracer.written_destination_pages),
+    }
+
+    (output_dir / "execution.json").write_text(
+        json.dumps(format_report(execution), indent=2), encoding="ascii")
+    if error:
+        progress(f"Emulation error: {error}")
+    elif tracer.stop_reason is None:
+        progress("Emulation returned without a recorded stop reason")
+    progress("Writing events")
     events_path = output_dir / "events.json"
     events_path.write_text(json.dumps(format_report(tracer.events), indent=2), encoding="ascii")
+    if error or not tracer.stop_reason or tracer.stop_reason.kind != "restored_code_entry":
+        reason = tracer.stop_reason.kind if tracer.stop_reason else "no_stop"
+        detail = tracer.stop_reason.details.get("reason", "") if tracer.stop_reason else ""
+        failure = f"Export refused ({reason}): {error or detail or 'unpacking did not reach restored code'}"
+        summary = {**execution, "input": str(input_path), "entry": entry,
+                   "unicorn_error": error, "analysis_pe": None,
+                   "reconstruction_error": failure, "events": str(events_path)}
+        (output_dir / "summary.json").write_text(
+            json.dumps(format_report(summary), indent=2), encoding="ascii")
+        raise SystemExit(log_line(f"export refused {reason}"))
+    progress("Summarizing sections and resolving imports")
     section_summaries = summarize_mapped_sections(uc, pe)
     import_report = build_resolved_import_report(uc, tracer, module_bases, import_slots, mapped_start)
     resolved_imports_path = output_dir / "resolved_imports.json"
@@ -1341,9 +1571,8 @@ def main():
     analysis_pe_path = None
     reconstruction_report_path = None
     reconstruction_error = None
+    progress("Reconstructing PE")
     try:
-        if error or not tracer.stop_reason or tracer.stop_reason.kind != "restored_code_entry":
-            raise ValueError("export requires restored_code_entry")
         ranges = tracer.restored_ranges()
         output, reconstruction = reconstruct_imports(dump_pe(uc.mem_read, mapped_start), import_report, ranges)
         analysis_pe_path = final_path
@@ -1369,6 +1598,7 @@ def main():
         "written_destination_pages": [page * PAGE_SIZE for page in sorted(tracer.written_destination_pages)],
         "instructions": tracer.instructions,
         "blocks": tracer.blocks,
+        "hooks": tracer.hook_statistics,
         "stack_copy_accelerations": tracer.stack_copy_count,
         "stack_copy_bytes": tracer.stack_copy_bytes,
         "discovered_crc_loops": [{"rva": address - mapped_start, "state_xor": candidate["state_xor"]}
@@ -1380,9 +1610,6 @@ def main():
         "resolved_import_slots": len(tracer.resolved_import_writes),
         "resolved_imports": str(resolved_imports_path),
         "crc_accelerations": tracer.crc_accelerations,
-        "decompressions": tracer.decompressions,
-        "decoder_candidates": list(tracer.decompressors.candidates),
-        "decoder_rejections": {hex(address): reason for address, reason in tracer.decompressors.rejected.items()},
         "stop_reason": tracer.stop_reason,
         "unicorn_error": error,
         "stop_registers": tracer.stop_registers,
@@ -1393,13 +1620,18 @@ def main():
         "reconstruction_error": reconstruction_error,
         "events": str(events_path),
     }
+    progress("Writing summary")
     (output_dir / "summary.json").write_text(json.dumps(format_report(summary), indent=2), encoding="ascii")
     if reconstruction_error:
-        reason = tracer.stop_reason.kind if tracer.stop_reason else "no_stop"
-        raise SystemExit(f"Export failed ({reason}): {reconstruction_error}")
-    print(f"PE: {analysis_pe_path}")
-    print(f"Imports: {reconstruction['import_count']}")
-    print(f"Stop: {tracer.stop_reason.kind}")
+        error = reconstruction_error.split(':', 1)[0]
+        raise SystemExit(log_line(f"export failed {error}"))
+    print("export complete")
+    print(f"imports {reconstruction['import_count']}")
+    print(log_line(f"stop {tracer.stop_reason.kind}"))
+    if reconstruction['exceptions'].get('error'):
+        print("exception directory cleared")
+    elif reconstruction['exceptions'].get('dropped_count'):
+        print(f"exception entries dropped {reconstruction['exceptions']['dropped_count']}")
 
 
 if __name__ == "__main__":

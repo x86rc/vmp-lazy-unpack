@@ -8,6 +8,6 @@ def import_slots(pe):
         module = descriptor.dll.decode("ascii").lower()
         for item in descriptor.imports:
 
-            symbol = item.name.decode("ascii") if item.name else item.ordinal
+            symbol = item.ordinal if item.import_by_ordinal else item.name.decode("ascii")
             result[item.address - pe.OPTIONAL_HEADER.ImageBase] = (module, symbol)
     return result

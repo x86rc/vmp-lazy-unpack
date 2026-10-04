@@ -152,7 +152,7 @@ def reconstruct_imports(data, report, restored_ranges):
                               ("runtime", report["resolved_imports"])):
         for record in records:
             slot = number(record["slot_rva"])
-            if not restored(slot):
+            if category == "recovered_iat" and not restored(slot):
                 continue
             if category == "recovered_iat" and number(record["emu_address"]) not in bootstrap_targets.get(identity(record), set()):
                 raise BuildError("scan-only import: bootstrap identity or pointer mismatch")
@@ -165,8 +165,6 @@ def reconstruct_imports(data, report, restored_ranges):
     encoded = {}
     for record in report.get("encoded_imports", []):
         slot = number(record["slot_rva"])
-        if not restored(slot):
-            continue
         key = record["key"]
         if record.get("encoding") != "subtract_signed_i32" or not isinstance(key, int) or not -(1 << 31) <= key < (1 << 31):
             raise BuildError("unsupported encoded import arithmetic")
@@ -185,7 +183,7 @@ def reconstruct_imports(data, report, restored_ranges):
         encoded[slot] = record
         selected.pop(slot, None)
     if not selected and not encoded:
-        raise BuildError("no verified import slots in restored ranges")
+        raise BuildError("no verified import slots")
     extras = {}
     for record in [item[0] for item in selected.values()] + list(encoded.values()):
         key = identity(record)
@@ -261,10 +259,23 @@ def reconstruct_imports(data, report, restored_ranges):
     verified = parse_pe(bytes(output))
     expected = dict(actual)
     expected.update({slot - base: key for key, slot in new_slots.items()})
-    if import_slots(verified) != expected:
-        raise BuildError("rebuilt imports did not round-trip")
+    verified_slots = import_slots(verified)
+    if verified_slots != expected:
+        missing = [(hex(slot), key) for slot, key in expected.items() if verified_slots.get(slot) != key]
+        unexpected = [(hex(slot), key) for slot, key in verified_slots.items() if expected.get(slot) != key]
+        raise BuildError(f"rebuilt import mismatch: {len(missing)} missing or changed {missing[:8]}; "
+                         f"{len(unexpected)} unexpected {unexpected[:8]}")
     write_u32(output, verified.OPTIONAL_HEADER.get_field_absolute_offset("CheckSum"), verified.generate_checksum())
-    output, exception_report = repair_exception_tables(bytes(output))
+    output = bytes(output)
+    try:
+        output, exception_report = repair_exception_tables(output)
+    except ValueError as exc:
+        output = bytearray(output)
+        set_directory(output, verified, 3, 0, 0)
+        checked = parse_pe(bytes(output))
+        write_u32(output, checked.OPTIONAL_HEADER.get_field_absolute_offset("CheckSum"), checked.generate_checksum())
+        output = bytes(output)
+        exception_report = {"status": "cleared", "error": str(exc)}
     for patch in patches:
         offset = patch["patch_file_offset"]
         if output[offset:offset + len(patch["new_bytes"])] != patch["new_bytes"]:
@@ -280,7 +291,6 @@ def reconstruct_imports(data, report, restored_ranges):
     return output, serializable_report({
         "input_sha256": input_sha256,
         "header_expansion": header_expansion,
-        "patch_offset_basis": "output file offsets; RVAs are unchanged",
         "import_storage": section,
         "exceptions": exception_report,
         "output_sha256": hashlib.sha256(output).hexdigest(),
@@ -292,7 +302,6 @@ def reconstruct_imports(data, report, restored_ranges):
         "plain_slot_patch_count": len(plain_patches), "plain_slot_patches": plain_patches,
         "import_thunk_count": len(thunks),
         "wrapper_resolution": wrapper_report,
-        "limitation": "Analysis-only PE; partial reference coverage; thunk pointers differ from exports.",
     })
 
 class BuildError(RuntimeError):
