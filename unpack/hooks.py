@@ -28,6 +28,8 @@ class TraceHooks:
                                                     begin=tracer.image_start, end=tracer.image_end - 1))
             self.handles.append(self.uc.hook_add(UC_HOOK_INSN, tracer.on_syscall_instruction,
                                                 None, 1, 0, ux.UC_X86_INS_SYSCALL))
+            self.handles.append(self.uc.hook_add(UC_HOOK_INSN, tracer.on_cpuid_instruction,
+                                                None, 1, 0, ux.UC_X86_INS_CPUID))
             self.handles.append(self.uc.hook_add(UC_HOOK_MEM_INVALID, tracer.on_invalid_memory))
             self.handles.append(self.uc.hook_add(UC_HOOK_INTR, tracer.single_step.interrupt))
             if tracer.diagnostics is not None:

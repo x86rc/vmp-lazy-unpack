@@ -12,6 +12,7 @@ MASK = (1 << 64) - 1
 REGS = [getattr(ux, 'UC_X86_REG_' + name.upper()) for name in
         ('rax', 'rbx', 'rcx', 'rdx', 'rsi', 'rdi', 'rbp', 'r8', 'r9',
          'r10', 'r11', 'r12', 'r13', 'r14', 'r15')]
+SCRATCH_REGS = {ux.UC_X86_REG_RAX, ux.UC_X86_REG_R10, ux.UC_X86_REG_R11}
 XMMS = [getattr(ux, f'UC_X86_REG_XMM{i}') for i in range(16)]
 
 
@@ -19,6 +20,9 @@ class WrapperOracle:
     def __init__(self, pe, image, records):
         self.base = pe.OPTIONAL_HEADER.ImageBase
         self.image = image
+        self.code_ranges = [(self.base + section.VirtualAddress,
+                             self.base + section.VirtualAddress + section.Misc_VirtualSize)
+                            for section in pe.sections if section.Characteristics & 0x20000000]
         self.uc = Uc(UC_ARCH_X86, UC_MODE_64)
         self.uc.mem_map(self.base, align_up(pe.OPTIONAL_HEADER.SizeOfImage, 4096), UC_PROT_READ | UC_PROT_EXEC)
         self.uc.mem_write(self.base, image)
@@ -65,8 +69,8 @@ class WrapperOracle:
             self.api = address
             uc.emu_stop()
             return
-        if not (self.source <= address < self.source_end or self.vm_start <= address < self.vm_end):
-            self.fail('code_outside_wrapper_section')
+        if not any(start <= address < end for start, end in self.code_ranges):
+            self.fail('code_outside_executable_sections')
             return
         self.trace.append(address)
         instruction = self.decoded.get(address)
@@ -93,6 +97,7 @@ class WrapperOracle:
         self.source, self.source_end = source, source + prefix_size + 5
         self.vm_start, self.vm_end = vm_start, vm_end
         self.api = None
+        self.failure_details = {}
         self.reason = 'instruction_or_time_limit'
         self.trace, self.reads, self.used = [], [], set()
         pattern = bytes(((i * 37 + seed * 71) & 255) for i in range(256))
@@ -112,7 +117,13 @@ class WrapperOracle:
             return None, self.reason
         if self.api is None:
             return None, self.reason
-        if any(uc.reg_read(reg) != value for reg, value in expected.items()):
+        changed = [reg for reg, value in expected.items()
+                   if reg not in SCRATCH_REGS and uc.reg_read(reg) != value]
+        if changed:
+            names = dict(zip(REGS, ('rax', 'rbx', 'rcx', 'rdx', 'rsi', 'rdi', 'rbp', 'r8', 'r9',
+                                    'r10', 'r11', 'r12', 'r13', 'r14', 'r15')))
+            names.update({register: f'xmm{index}' for index, register in enumerate(XMMS)})
+            self.failure_details['registers'] = [names[register] for register in changed]
             return None, 'registers_changed'
         if uc.reg_read(ux.UC_X86_REG_EFLAGS) != flags:
             return None, 'flags_changed'
@@ -158,6 +169,7 @@ def resolve_import_wrappers(pe, image, records, destinations, restored_ranges):
     decoder = Cs(CS_ARCH_X86, CS_MODE_64)
     decoder.skipdata = True
     patches, rejected = [], Counter()
+    rejected_candidates = []
     candidates = 0
     branch_targets = set()
     for section in sections:
@@ -184,7 +196,8 @@ def resolve_import_wrappers(pe, image, records, destinations, restored_ranges):
                 source = instruction.address
                 prefix = 0
                 if previous is not None and previous.address + previous.size == source and (
-                        (previous.mnemonic == 'push' and previous.size <= 2) or previous.mnemonic == 'pushfq'):
+                        (previous.mnemonic == 'push' and previous.size <= 2) or previous.mnemonic == 'pushfq' or
+                        (previous.mnemonic == 'nop' and previous.size <= 2)):
                     prefix = previous.size
                     source = previous.address
                 if candidates > 4096:
@@ -194,6 +207,8 @@ def resolve_import_wrappers(pe, image, records, destinations, restored_ranges):
                                                      base + vm.VirtualAddress + vm.Misc_VirtualSize)
                 if result is None:
                     rejected[reason] += 1
+                    rejected_candidates.append(dict(address=hex(source), target=hex(target), reason=reason,
+                                                    **(oracle.failure_details if candidates <= 4096 else {})))
                 else:
                     length, record = result
                     symbol = record['symbol']
@@ -225,4 +240,5 @@ def resolve_import_wrappers(pe, image, records, destinations, restored_ranges):
             safe.append(patch)
     patches = safe
     return patches, {'candidate_count': candidates, 'resolved_count': len(patches),
-                     'rejected': dict(rejected), 'states_per_candidate': 3}
+                     'rejected': dict(rejected), 'rejected_candidates': rejected_candidates,
+                     'states_per_candidate': 3}

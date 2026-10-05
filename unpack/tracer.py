@@ -24,6 +24,8 @@ from .discover import recover_keys
 from .progress import watch_run, log_line
 from .diagnostics import Diagnostics
 from .hooks import TraceHooks
+from .import_calls import ImportCallLog
+from .imports import import_address_metadata
 from .single_step import SingleStep
 from .records import ModuleImage, ImportWrite, Event, format_report
 from .pe import (write_pe_structure, memory_image, IMAGE_FILE_HEADER, IMAGE_EXPORT_DIRECTORY,
@@ -615,6 +617,8 @@ class Tracer:
         self.uc = uc
         self.progress = progress
         self.diagnostics = diagnostics
+        self.import_log = None
+        self.cpuid_engine = None
         self.last_progress_time = time.monotonic()
         self.recent_blocks = deque(maxlen=32)
         self.ordinary_blocks = set()
@@ -1074,10 +1078,23 @@ class Tracer:
             capture("output_after", r8, min(int(r9), 64))
             capture("return_length_after", return_length, 4)
         elif canonical_symbol == "ntquerysysteminformation":
-            if rdx and r8:
-                self.uc.mem_write(rdx, b"\x00" * min(int(r8), 0x1000))
-            self.write_u32_if_mapped(r9, 0)
-            result = 0
+            if (rcx & 0xFFFFFFFF) == 0x23:
+                details.update(information_class=0x23, output_length=r8 & 0xFFFFFFFF)
+                try:
+                    if r9:
+                        self.uc.mem_write(r9, (2).to_bytes(4, 'little'))
+                    if (r8 & 0xFFFFFFFF) < 2:
+                        result = 0xC0000004
+                    else:
+                        self.uc.mem_write(rdx, b"\x00\x01")
+                        result = 0
+                except UcError:
+                    result = 0xC0000005
+            else:
+                if rdx and r8:
+                    self.uc.mem_write(rdx, b"\x00" * min(int(r8), 0x1000))
+                self.write_u32_if_mapped(r9, 0)
+                result = 0
         elif symbol_lower == "getcurrentprocess":
             result = 0xFFFFFFFFFFFFFFFF
         elif symbol_lower == "getprocessaffinitymask":
@@ -1154,9 +1171,15 @@ class Tracer:
         else:
             self.blocks = self.block_counter()
         self.instructions = self.blocks
+        label = self.synthetic_import_targets.get(address)
+        if label is not None and self.import_log is not None:
+            self.import_log.begin(uc, address, label, self.blocks)
         if (self.single_step.active and
                 self.synthetic_import_targets.get(address, '').lower().endswith('!rtlunwindex')):
             self.single_step.unwind()
+            if self.import_log is not None:
+                self.import_log.finish('stopped' if self.stop_reason else 'unwind',
+                                       target=hex(uc.reg_read(ux.UC_X86_REG_RIP)))
             return
         if self.single_step.on_block(address):
             return
@@ -1210,10 +1233,15 @@ class Tracer:
             try:
                 result, details = self.emulate_import(label)
             except Exception as error:
+                if self.import_log is not None:
+                    self.import_log.finish('error', error=str(error))
                 self.stop(
                     "import_stub_error", address, import_name=label, error=str(error)
                 )
                 return
+            if self.import_log is not None:
+                self.import_log.finish('returned' if result is not None else 'stopped', result,
+                                       details=format_report(details))
             if self.diagnostics:
                 self.diagnostics.api_return(uc, label, arguments, result, details, self.blocks)
             if result is None:
@@ -1253,6 +1281,36 @@ class Tracer:
                 and address not in self.stack_copy_candidates
                 and address not in self.discovered_crc_loops):
             self.ordinary_blocks.add(address)
+
+    def on_cpuid_instruction(self, uc, user_data):
+        leaf = uc.reg_read(ux.UC_X86_REG_EAX)
+        subleaf = uc.reg_read(ux.UC_X86_REG_ECX)
+        registers = (ux.UC_X86_REG_RAX, ux.UC_X86_REG_RBX,
+                     ux.UC_X86_REG_RCX, ux.UC_X86_REG_RDX)
+        values = None
+        if leaf == 1:
+            if self.cpuid_engine is None:
+                self.cpuid_engine = Uc(UC_ARCH_X86, UC_MODE_64)
+                self.cpuid_engine.ctl_set_cpu_model(uc.ctl_get_cpu_model())
+                self.cpuid_engine.mem_map(0x1000, PAGE_SIZE)
+                self.cpuid_engine.mem_write(0x1000, b'\x0f\xa2')
+            cpu = self.cpuid_engine
+            cpu.reg_write(ux.UC_X86_REG_CR4, uc.reg_read(ux.UC_X86_REG_CR4))
+            cpu.reg_write(ux.UC_X86_REG_EAX, leaf)
+            cpu.reg_write(ux.UC_X86_REG_ECX, subleaf)
+            cpu.emu_start(0x1000, 0x1002, count=1)
+            values = [cpu.reg_read(register) & 0xFFFFFFFF for register in registers]
+            values[2] &= ~(1 << 31)
+        elif 0x40000000 <= leaf < 0x50000000:
+            values = [0, 0, 0, 0]
+        details = dict(leaf=hex(leaf), subleaf=hex(subleaf),
+                       action='emulated' if values is not None else 'unicorn')
+        if values is not None:
+            for register, value in zip(registers, values):
+                uc.reg_write(register, value)
+            details['output'] = dict(zip(('eax', 'ebx', 'ecx', 'edx'), map(hex, values)))
+        self.add_event('cpuid', uc.reg_read(ux.UC_X86_REG_RIP), **details)
+        return int(values is not None)
 
     def on_syscall_instruction(self, uc, user_data):
         address = uc.reg_read(ux.UC_X86_REG_RIP)
@@ -1409,8 +1467,6 @@ def final_output_path(input_path, output_name=None, directory=None):
     if not Path(name).suffix:
         name += suffix
     path = directory.resolve() / name
-    if path == input_path.resolve() or path.exists():
-        raise FileExistsError(f"refusing to overwrite: {path}")
     return path
 
 
@@ -1521,7 +1577,9 @@ def run(input_path, final_path, output_dir, progress, diagnostics=None):
     progress("Emulating unpacker")
     if diagnostics:
         diagnostics.checkpoint(uc, blocks=0, entry=entry)
-    with TraceHooks(tracer, PEB_BASE, PAGE_SIZE) as hooks:
+    with ImportCallLog(output_dir / 'import_calls.json') as import_log, \
+            TraceHooks(tracer, PEB_BASE, PAGE_SIZE) as hooks:
+        tracer.import_log = import_log
         progress(f"Hook backend: {hooks.backend}")
         if hooks.backend == 'python':
             print('using python hooks')
@@ -1575,10 +1633,15 @@ def run(input_path, final_path, output_dir, progress, diagnostics=None):
     try:
         ranges = tracer.restored_ranges()
         output, reconstruction = reconstruct_imports(dump_pe(uc.mem_read, mapped_start), import_report, ranges)
+        with pefile.PE(data=output) as rebuilt:
+            import_metadata = import_address_metadata(rebuilt, output, import_report)
         analysis_pe_path = final_path
         analysis_pe_path.parent.mkdir(parents=True, exist_ok=True)
-        with analysis_pe_path.open("xb") as stream:
+        with analysis_pe_path.open("wb") as stream:
             stream.write(output)
+        import_metadata_path = analysis_pe_path.with_name(analysis_pe_path.name + '.imports.json')
+        import_metadata_path.write_text(json.dumps(import_metadata, indent=2), encoding='ascii')
+        reconstruction['import_addresses'] = str(import_metadata_path)
         reconstruction["output"] = str(analysis_pe_path)
         reconstruction_report_path = output_dir / "analysis.imports.json"
         reconstruction_report_path.write_text(json.dumps(format_report(reconstruction), indent=2), encoding="ascii")

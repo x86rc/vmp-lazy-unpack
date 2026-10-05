@@ -79,22 +79,20 @@ def extra_imports(pe, records, section_rva):
         module, symbol = identity(record)
         groups.setdefault(module, []).append((symbol, record))
     existing = list(getattr(pe, "DIRECTORY_ENTRY_IMPORT", []))
-    descriptor_size = (len(existing) + len(groups) + 1) * 20
+    names = {}
+    for descriptor in existing:
+        names.setdefault(descriptor.dll.decode("ascii").lower(), descriptor.dll.decode("ascii"))
+    descriptor_size = (len(groups) + 1) * 20
     content = bytearray(descriptor_size)
     slots = {}
 
     def pad(alignment):
         content.extend(bytes(align_up(len(content), alignment) - len(content)))
 
-    for index, descriptor in enumerate(existing):
-
-        write_pe_structure(content, index * 20, IMAGE_IMPORT_DESCRIPTOR,
-                           OriginalFirstThunk=descriptor.struct.OriginalFirstThunk,
-                           Name=descriptor.struct.Name,
-                           FirstThunk=descriptor.struct.FirstThunk)
-    for index, (module, imports) in enumerate(sorted(groups.items()), len(existing)):
+    for index, (module, imports) in enumerate(sorted(groups.items())):
         name_rva = section_rva + len(content)
-        content.extend(module.encode("ascii") + b"\0")
+        name = names.get(module, module[:-4].upper() + '.dll' if module.endswith('.dll') else module.upper())
+        content.extend(name.encode("ascii") + b"\0")
         thunks = []
         for symbol, _ in imports:
             if isinstance(symbol, int):
@@ -189,13 +187,25 @@ def reconstruct_imports(data, report, restored_ranges):
         key = identity(record)
         if key not in bootstrap:
             extras.setdefault(key, record)
+    for slot, key in actual.items():
+        if slot in encoded:
+            raise BuildError("encoded slot overlaps an existing PE import")
+        if slot in selected:
+            if identity(selected[slot][0]) != key:
+                raise BuildError("observed slot conflicts with an existing PE import")
+        else:
+            selected[slot] = (dict(module=key[0], symbol=key[1], slot_rva=slot,
+                                   emu_address=read_u64(data, file_offset(pe, slot, 8))), 'bootstrap')
+    records = {}
+    for record in [item[0] for item in selected.values()] + list(encoded.values()):
+        records.setdefault(identity(record), record)
     section_rva = storage["payload_rva"]
-    content, descriptor_size, new_slots = extra_imports(pe, list(extras.values()), section_rva)
-    destinations = {**bootstrap, **new_slots}
+    content, descriptor_size, new_slots = extra_imports(pe, list(records.values()), section_rva)
+    destinations = new_slots
     content = bytearray(content)
 
 
-    plain = {slot: record for slot, (record, _) in selected.items() if slot not in actual}
+    plain = {slot: record for slot, (record, _) in selected.items()}
     for slot, (record, _) in selected.items():
         if slot in actual and actual[slot] != identity(record):
             raise BuildError("observed slot conflicts with an existing PE import")
@@ -237,11 +247,10 @@ def reconstruct_imports(data, report, restored_ranges):
     instruction_patches = {byte for patch in patches for byte in range(patch["patch_file_offset"], patch["patch_file_offset"] + len(patch["new_bytes"]))}
     slot_records = [(slot, record, record["key"], encoded_patches) for slot, record in encoded.items()]
     slot_records += [(slot, record, 0, plain_patches) for slot, record in plain.items()]
-    existing_iat_bytes = {byte for slot in actual for byte in range(file_offset(pe, slot, 8), file_offset(pe, slot, 8) + 8)}
     for slot, record, key, patch_list in slot_records:
         offset = file_offset(pe, slot, 8)
         covered = set(range(offset, offset + 8))
-        if covered & (occupied | instruction_patches | existing_iat_bytes):
+        if covered & (occupied | instruction_patches):
             raise BuildError("overlapping import slot patches")
         occupied.update(covered)
         thunk = thunks[identity(record)]
@@ -257,8 +266,7 @@ def reconstruct_imports(data, report, restored_ranges):
     set_directory(output, pe, 1, section_rva, descriptor_size)
     set_directory(output, pe, 12, 0, 0)
     verified = parse_pe(bytes(output))
-    expected = dict(actual)
-    expected.update({slot - base: key for key, slot in new_slots.items()})
+    expected = {slot - base: key for key, slot in new_slots.items()}
     verified_slots = import_slots(verified)
     if verified_slots != expected:
         missing = [(hex(slot), key) for slot, key in expected.items() if verified_slots.get(slot) != key]
