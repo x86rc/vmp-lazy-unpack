@@ -727,7 +727,7 @@ class Tracer:
             self.diagnostics.checkpoint(self.uc, blocks=self.blocks, stop_reason=event,
                                         recent_blocks=list(self.recent_blocks))
         if self.progress:
-            self.progress(f"stop {event.kind}")
+            self.progress(event.kind)
 
     def stop(self, kind, address, **details):
         self.stop_event(self.add_event(kind, address, **details))
@@ -1384,7 +1384,7 @@ class Tracer:
         for start, end, name in self.packed_destination_ranges:
             if start <= address < end:
                 observed = address // PAGE_SIZE in self.written_destination_pages
-                self.stop("restored_code_entry" if observed else "unrestored_code_entry",
+                self.stop("emulation_reached_unpacked_entry" if observed else "unrestored_code_entry",
                           address, section=name, observed_write=observed,
                           reason=("Execution reached a page written during emulation in a section with no raw data."
                                   if observed else
@@ -1484,6 +1484,7 @@ def build_argument_parser():
 
 
 def main():
+    started = time.monotonic()
     args = build_argument_parser().parse_args()
     try:
         input_path = args.pe.resolve(strict=True)
@@ -1496,6 +1497,19 @@ def main():
     diagnostic_context = Diagnostics(output_dir) if args.diagnostics else nullcontext(None)
     with watch_run(output_dir) as progress, diagnostic_context as diagnostics:
         run(input_path, final_path, output_dir, progress, diagnostics)
+    print(f"{round(time.monotonic() - started)} seconds elapsed")
+
+
+def print_resolution_counts(reconstruction):
+    counts = Counter(('wrapper' if patch['category'] == 'encoded_wrapper' else 'static', patch['mnemonic'])
+                     for patch in reconstruction['patches'])
+    print(f"static calls {counts['static', 'call']} jumps {counts['static', 'jmp']} "
+          f"loads {counts['static', 'mov']} pushes {counts['static', 'push']}")
+    print(f"wrapper candidates {reconstruction['wrapper_resolution']['candidate_count']} "
+          f"calls {counts['wrapper', 'call']} jumps {counts['wrapper', 'jmp']}")
+    print(f"slots plain {reconstruction['plain_slot_patch_count']} "
+          f"encoded {reconstruction['encoded_slot_patch_count']}")
+    print(f"{len(reconstruction['patches'])} import calls resolved")
 
 
 def run(input_path, final_path, output_dir, progress, diagnostics=None):
@@ -1611,7 +1625,7 @@ def run(input_path, final_path, output_dir, progress, diagnostics=None):
     progress("Writing events")
     events_path = output_dir / "events.json"
     events_path.write_text(json.dumps(format_report(tracer.events), indent=2), encoding="ascii")
-    if error or not tracer.stop_reason or tracer.stop_reason.kind != "restored_code_entry":
+    if error or not tracer.stop_reason or tracer.stop_reason.kind != "emulation_reached_unpacked_entry":
         reason = tracer.stop_reason.kind if tracer.stop_reason else "no_stop"
         detail = tracer.stop_reason.details.get("reason", "") if tracer.stop_reason else ""
         failure = f"Export refused ({reason}): {error or detail or 'unpacking did not reach restored code'}"
@@ -1689,8 +1703,9 @@ def run(input_path, final_path, output_dir, progress, diagnostics=None):
         error = reconstruction_error.split(':', 1)[0]
         raise SystemExit(log_line(f"export failed {error}"))
     print("export complete")
-    print(f"imports {reconstruction['import_count']}")
-    print(log_line(f"stop {tracer.stop_reason.kind}"))
+    print(f"{reconstruction['import_count']} iat entries")
+    print_resolution_counts(reconstruction)
+    print(log_line(tracer.stop_reason.kind))
     if reconstruction['exceptions'].get('error'):
         print("exception directory cleared")
     elif reconstruction['exceptions'].get('dropped_count'):

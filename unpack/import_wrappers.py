@@ -127,10 +127,11 @@ class WrapperOracle:
             return None, 'registers_changed'
         if uc.reg_read(ux.UC_X86_REG_EFLAGS) != flags:
             return None, 'flags_changed'
-        if uc.reg_read(ux.UC_X86_REG_RSP) != self.sp - 8 or bytes(uc.mem_read(self.sp, 256)) != caller:
+        stack = uc.reg_read(ux.UC_X86_REG_RSP)
+        if stack not in (self.sp - 8, self.sp) or bytes(uc.mem_read(self.sp, 256)) != caller:
             return None, 'stack_changed'
-        returned = read_u64(uc.mem_read(self.sp - 8, 8))
-        length = returned - source
+        transfer = 'call' if stack == self.sp - 8 else 'jmp'
+        length = read_u64(uc.mem_read(self.sp - 8, 8)) - source if transfer == 'call' else prefix_size + 5
         if length not in (6, 7) or length < prefix_size + 5:
             return None, 'unexpected_return_address'
         matching = [r for r in self.apis[self.api] if number(r['slot_rva']) in self.used]
@@ -138,7 +139,7 @@ class WrapperOracle:
             return None, 'no_encoded_slot_read'
         record = matching[0]
 
-        return (length, record, tuple(self.trace), tuple(self.reads)), None
+        return (length, record, tuple(self.trace), tuple(self.reads), transfer), None
 
     def resolve(self, source, prefix_size, vm_start, vm_end):
         first = None
@@ -149,6 +150,7 @@ class WrapperOracle:
             if first is not None and result != first:
                 return None, 'input_dependent_path'
             first = result
+        self.transfer = first[4]
         return (first[0], first[1]), None
 
 
@@ -220,9 +222,10 @@ def resolve_import_wrappers(pe, image, records, destinations, restored_ranges):
                         rejected['iat_out_of_range'] += 1
                     else:
                         rva = source - base
-                        new = (b'\x48' if length == 7 else b'') + b'\xff\x15' + encode_i32(displacement)
+                        opcode = b'\xff\x15' if oracle.transfer == 'call' else b'\xff\x25'
+                        new = (b'\x48' if length == 7 else b'') + opcode + encode_i32(displacement)
                         patches.append(dict(instruction_va=source, instruction_rva=rva,
-                            instruction_size=length, mnemonic='call', patch_va=source, patch_rva=rva,
+                            instruction_size=length, mnemonic=oracle.transfer, patch_va=source, patch_rva=rva,
                             patch_file_offset=file_offset(pe, rva, length), old_bytes=image[rva:rva + length],
                             new_bytes=new, old_target_va=target, new_target_va=destination,
                             category='encoded_wrapper', module=record['module'], symbol=record['symbol']))

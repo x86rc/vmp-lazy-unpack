@@ -3,7 +3,7 @@ import struct
 from collections import Counter
 import pefile
 from capstone import CS_ARCH_X86, CS_MODE_64, Cs
-from capstone.x86 import X86_OP_MEM, X86_REG_RIP
+from capstone.x86 import X86_OP_MEM, X86_OP_REG, X86_REG_RIP
 from .binary import encode_i32, encode_u64, read_i32, read_u64, write_u32, write_u64
 from .pe import align_up, parse_pe, file_offset
 from .pe import write_pe_structure, IMAGE_IMPORT_DESCRIPTOR
@@ -325,6 +325,8 @@ def scan_import_references(
 ):
     decoder = Cs(CS_ARCH_X86, CS_MODE_64)
     decoder.detail = True
+    boundary_decoder = Cs(CS_ARCH_X86, CS_MODE_64)
+    boundary_decoder.skipdata = True
     image_base = pe.OPTIONAL_HEADER.ImageBase
     execute_flag = pefile.SECTION_CHARACTERISTICS["IMAGE_SCN_MEM_EXECUTE"]
     patches = {}
@@ -335,10 +337,19 @@ def scan_import_references(
         start_rva = section.VirtualAddress
         size = section.Misc_VirtualSize
         data = image[start_rva : start_rva + size]
+        boundaries = None
+        boundary = None
         offset = 0
         while offset + 6 <= len(data):
             prefix_size = 0
             if (
+                0x48 <= data[offset] <= 0x4F
+                and offset + 7 <= len(data)
+                and data[offset + 1] == 0x8B
+                and data[offset + 2] & 0xC7 == 0x05
+            ):
+                prefix_size = 1
+            elif (
                 0x40 <= data[offset] <= 0x4F
                 and offset + 7 <= len(data)
                 and data[offset + 1] == 0xFF
@@ -364,7 +375,12 @@ def scan_import_references(
                 offset += 1
                 continue
             instruction = decoded[0]
-            if instruction.mnemonic not in ("call", "jmp", "push"):
+            pointer_load = (instruction.mnemonic == 'mov' and len(instruction.operands) == 2
+                            and instruction.operands[0].type == X86_OP_REG
+                            and instruction.operands[0].size == 8
+                            and instruction.operands[1].type == X86_OP_MEM
+                            and instruction.operands[1].size == 8)
+            if instruction.mnemonic not in ("call", "jmp", "push") and not pointer_load:
                 offset += 1
                 continue
             targets = [
@@ -376,6 +392,16 @@ def scan_import_references(
             if not matched:
                 offset += 1
                 continue
+            if pointer_load:
+                if boundaries is None:
+                    boundaries = boundary_decoder.disasm_lite(data, image_base + start_rva)
+                while boundary is None or boundary[0] + boundary[1] <= instruction.address:
+                    boundary = next(boundaries, None)
+                    if boundary is None:
+                        break
+                if boundary is None or boundary[0] != instruction.address:
+                    offset += 1
+                    continue
             if len(matched) != 1 or instruction.disp_size != 4:
                 raise BuildError(
                     f"ambiguous import reference at 0x{instruction.address:X}"

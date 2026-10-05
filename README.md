@@ -21,9 +21,7 @@ The project uses Unicorn to emulate syscalls used by VMProtect's unpacker and im
 py -m pip install -e .
 ```
 
-Installs `pefile`, `capstone`, and `unicorn`.
-
-The optional C extension builds automatically during installation. Install Microsoft C++ Build Tools first to enable it on Windows; otherwise Python hooks are used.
+For decent speeds its recommended to install Microsoft C++ Build Tools so the C helper is used. If not installed the unpacking falls back to purely python based hooks (slower).
 
 ## Usage
 
