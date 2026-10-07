@@ -1,5 +1,4 @@
 import argparse
-import hashlib
 import json
 import struct
 import time
@@ -18,6 +17,8 @@ from .catalog import Catalog, find_or_capture_catalog
 from .dump import dump_pe
 from .reconstruct import reconstruct_imports
 from .loader_crc import discover_crc_loops, accelerate_crc
+from .semantic_lzma import discover_lzma_candidates
+from .lzma_adapter import DecoderAccelerator
 from .file_model import FileModel
 from .encoded_imports import recover_encoded_imports
 from .discover import recover_keys
@@ -204,7 +205,7 @@ def build_emu_module_blob(module_name, symbols, module_base):
 
     string_size = len(module_name.encode("ascii")) + 1 + sum(len(name.encode("ascii")) + 1 for name in named)
     if strings_rva + string_size > stubs_rva or stubs_rva + function_count * 16 > EMU_MODULE_SIZE:
-        raise ValueError(f"captured export table exceeds synthetic module capacity: {module_name}")
+        raise ValueError(f"export table too large: {module_name}")
 
     blob = bytearray(EMU_MODULE_SIZE)
     write_u16(blob, 0x00, 0x5A4D)
@@ -376,7 +377,6 @@ def summarize_mapped_sections(uc, pe):
             "virtual_size": size,
             "raw_size": section.SizeOfRawData,
             "nonzero_bytes": sum(value != 0 for value in data),
-            "sha256": hashlib.sha256(data).hexdigest().upper(),
         })
     return summaries
 
@@ -470,7 +470,6 @@ def build_resolved_import_report(
         "image_base": image_base,
         "encoded_import_tables": encoded["tables"],
         "encoded_imports": encoded["imports"],
-        "encoded_import_slot_count": len(encoded["imports"]),
         "stop_reason": tracer.stop_reason,
         "emu_modules": {
             name: {
@@ -479,16 +478,12 @@ def build_resolved_import_report(
             }
             for name, base in sorted(module_bases.items())
         },
-        "bootstrap_iat_count": len(bootstrap_imports),
         "bootstrap_iat": bootstrap_imports,
         "resolved_write_count": tracer.resolved_write_count,
-        "resolved_slot_count": len(restored_imports),
         "resolved_imports": restored_imports,
-        "recovered_iat_count": len(recovered_iat),
         "recovered_iat_matches_bootstrap": recovered_iat_matches_bootstrap,
         "recovered_iat_modules": dict(sorted(recovered_iat_modules.items())),
         "recovered_iat": recovered_iat,
-        "final_image_match_count": len(final_image_matches),
         "final_image_matches": final_image_matches,
     }
 
@@ -662,6 +657,11 @@ class Tracer:
         if progress:
             progress("Discovering CRC loops")
         self.discovered_crc_loops = discover_crc_loops(pe)
+        if progress:
+            progress('identifying lzma')
+        self.lzma_sites = discover_lzma_candidates(pe)
+        self.decompressors = DecoderAccelerator(pe, self.lzma_sites)
+        self.decompressions = []
         for section in pe.sections:
             raw = section.get_data()
             cursor = 0
@@ -673,6 +673,8 @@ class Tracer:
             "crc_candidates": [{"address": address, "kind": candidate.get('kind', 'crc')}
                                for address, candidate in self.discovered_crc_loops.items()],
             "stack_copy_candidates": sorted(self.stack_copy_candidates),
+            "lzma_sites": self.lzma_sites,
+            "lzma_decoders": sorted(self.decompressors.candidates),
         }
         if diagnostics:
             diagnostics.record('accelerator_discovery', **discovery)
@@ -682,6 +684,7 @@ class Tracer:
                                                [(start, start + len(raw)) for start, raw in ranges])
         if progress:
             progress(f"crc {len(self.discovered_crc_loops)} "
+                     f"lzma {len(self.decompressors.candidates)} "
                      f"stack copies {len(self.stack_copy_candidates)}")
 
         sections = sorted(pe.sections, key=lambda section: section.VirtualAddress)
@@ -1213,6 +1216,16 @@ class Tracer:
 
         if self.check_restored_entry(address):
             return
+        if address in self.decompressors.candidates:
+            details, reason = self.decompressors.try_decode(
+                uc, address, self.image_start, self.image_end, self.packed_destination_ranges)
+            if reason:
+                self.add_event('lzma_fallback', address, reason=reason)
+            if details:
+                self.on_image_write(uc, None, details['destination'], details['uncompressed_size'], 0, None)
+                self.decompressions.append(details)
+                self.add_event('lzma_accelerated', address, **details)
+                return
         if address in self.stack_copy_candidates and self.try_stack_copy(address):
             return
         if address in self.discovered_crc_loops:
@@ -1279,7 +1292,8 @@ class Tracer:
 
         if (len(self.ordinary_blocks) < 32768
                 and address not in self.stack_copy_candidates
-                and address not in self.discovered_crc_loops):
+                and address not in self.discovered_crc_loops
+                and address not in self.decompressors.candidates):
             self.ordinary_blocks.add(address)
 
     def on_cpuid_instruction(self, uc, user_data):
@@ -1386,9 +1400,6 @@ class Tracer:
                 observed = address // PAGE_SIZE in self.written_destination_pages
                 self.stop("emulation_reached_unpacked_entry" if observed else "unrestored_code_entry",
                           address, section=name, observed_write=observed,
-                          reason=("Execution reached a page written during emulation in a section with no raw data."
-                                  if observed else
-                                  "Execution reached an unwritten page in a section with no raw data."),
                           at_pe_entry=address == self.entry_address,
                           first_block=self.blocks == 1,
                           block_count=self.blocks,
@@ -1479,7 +1490,9 @@ def build_argument_parser():
     parser = LogArgumentParser(prog="python -m unpack", add_help=False, allow_abbrev=False)
     parser.add_argument("pe", type=Path)
     parser.add_argument("output_name", nargs="?")
-    parser.add_argument("--diagnostics", action="store_true")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--diagnostics", action="store_true")
+    mode.add_argument("--imports_only", action="store_true")
     return parser
 
 
@@ -1488,7 +1501,14 @@ def main():
     args = build_argument_parser().parse_args()
     try:
         input_path = args.pe.resolve(strict=True)
-        final_path = final_output_path(input_path, args.output_name)
+        output_name = args.output_name
+        if args.imports_only and output_name is None:
+            output_name = input_path.stem + '_imports' + (input_path.suffix or '.bin')
+        final_path = final_output_path(input_path, output_name)
+        if args.imports_only:
+            from .static_imports import run_static_imports
+            run_static_imports(input_path, final_path)
+            return
     except (ValueError, OSError) as exc:
         raise SystemExit(log_line(exc)) from exc
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
@@ -1505,11 +1525,10 @@ def print_resolution_counts(reconstruction):
                      for patch in reconstruction['patches'])
     print(f"static calls {counts['static', 'call']} jumps {counts['static', 'jmp']} "
           f"loads {counts['static', 'mov']} pushes {counts['static', 'push']}")
-    print(f"wrapper candidates {reconstruction['wrapper_resolution']['candidate_count']} "
-          f"calls {counts['wrapper', 'call']} jumps {counts['wrapper', 'jmp']}")
-    print(f"slots plain {reconstruction['plain_slot_patch_count']} "
-          f"encoded {reconstruction['encoded_slot_patch_count']}")
-    print(f"{len(reconstruction['patches'])} import calls resolved")
+    print(f"wrapper calls {counts['wrapper', 'call']} jumps {counts['wrapper', 'jmp']}")
+    print(f"slots plain {len(reconstruction['plain_slot_patches'])} "
+          f"encoded {len(reconstruction['encoded_slot_patches'])}")
+    print(f"{len(reconstruction['patches'])} resolutions")
 
 
 def run(input_path, final_path, output_dir, progress, diagnostics=None):
@@ -1530,10 +1549,8 @@ def run(input_path, final_path, output_dir, progress, diagnostics=None):
         raise SystemExit("expected pe32 plus")
     pe.parse_data_directories(directories=[pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_IMPORT"]])
     is_dll = bool(pe.FILE_HEADER.Characteristics & 0x2000)
-    input_sha256 = hashlib.sha256(input_bytes).hexdigest()
     if diagnostics:
-        diagnostics.record('input', path=str(input_path), sha256=input_sha256,
-                           catalog_sha256=require_catalog().sha256)
+        diagnostics.record('input', path=str(input_path))
     image_base = pe.OPTIONAL_HEADER.ImageBase
     entry = image_base + pe.OPTIONAL_HEADER.AddressOfEntryPoint
     image_end = image_base + align_up(pe.OPTIONAL_HEADER.SizeOfImage)
@@ -1546,8 +1563,6 @@ def run(input_path, final_path, output_dir, progress, diagnostics=None):
     progress("Collecting imports and syscall candidates")
     import_slots = collect_imports(pe)
     candidates = raw_syscall_candidates(pe)
-    (output_dir / "raw_syscall_candidates.json").write_text(
-        json.dumps([f"0x{address:X}" for address in candidates], indent=2), encoding="ascii")
 
     progress("Mapping image and Windows environment")
     uc = Uc(UC_ARCH_X86, UC_MODE_64)
@@ -1621,20 +1636,19 @@ def run(input_path, final_path, output_dir, progress, diagnostics=None):
     if error:
         progress(f"Emulation error: {error}")
     elif tracer.stop_reason is None:
-        progress("Emulation returned without a recorded stop reason")
+        progress("emulation ended without a stop reason")
     progress("Writing events")
     events_path = output_dir / "events.json"
     events_path.write_text(json.dumps(format_report(tracer.events), indent=2), encoding="ascii")
     if error or not tracer.stop_reason or tracer.stop_reason.kind != "emulation_reached_unpacked_entry":
         reason = tracer.stop_reason.kind if tracer.stop_reason else "no_stop"
-        detail = tracer.stop_reason.details.get("reason", "") if tracer.stop_reason else ""
-        failure = f"Export refused ({reason}): {error or detail or 'unpacking did not reach restored code'}"
+        failure = f"unpack failed: {error or reason}"
         summary = {**execution, "input": str(input_path), "entry": entry,
-                   "unicorn_error": error, "analysis_pe": None,
+                   "analysis_pe": None,
                    "reconstruction_error": failure, "events": str(events_path)}
         (output_dir / "summary.json").write_text(
             json.dumps(format_report(summary), indent=2), encoding="ascii")
-        raise SystemExit(log_line(f"export refused {reason}"))
+        raise SystemExit(log_line(failure))
     progress("Summarizing sections and resolving imports")
     section_summaries = summarize_mapped_sections(uc, pe)
     import_report = build_resolved_import_report(uc, tracer, module_bases, import_slots, mapped_start)
@@ -1648,7 +1662,7 @@ def run(input_path, final_path, output_dir, progress, diagnostics=None):
         ranges = tracer.restored_ranges()
         output, reconstruction = reconstruct_imports(dump_pe(uc.mem_read, mapped_start), import_report, ranges)
         with pefile.PE(data=output) as rebuilt:
-            import_metadata = import_address_metadata(rebuilt, output, import_report)
+            import_metadata = import_address_metadata(rebuilt, import_report)
         analysis_pe_path = final_path
         analysis_pe_path.parent.mkdir(parents=True, exist_ok=True)
         with analysis_pe_path.open("wb") as stream:
@@ -1663,15 +1677,12 @@ def run(input_path, final_path, output_dir, progress, diagnostics=None):
         reconstruction_error = str(exc)
 
     summary = {
-        "catalog_sha256": require_catalog().sha256,
         "catalog_windows": require_catalog().windows,
         "input": str(input_path),
-        "input_sha256": input_sha256,
         "image_base": mapped_start,
         "image_end": mapped_end,
         "entry": entry,
         "entry_kind": "dll" if is_dll else "exe",
-        "dll_reason_rdx": "0x1" if is_dll else None,
         "written_destination_pages": [page * PAGE_SIZE for page in sorted(tracer.written_destination_pages)],
         "instructions": tracer.instructions,
         "blocks": tracer.blocks,
@@ -1687,6 +1698,11 @@ def run(input_path, final_path, output_dir, progress, diagnostics=None):
         "resolved_import_slots": len(tracer.resolved_import_writes),
         "resolved_imports": str(resolved_imports_path),
         "crc_accelerations": tracer.crc_accelerations,
+        "lzma_sites": tracer.lzma_sites,
+        "lzma_decoders": sorted(tracer.decompressors.candidates),
+        "lzma_rejected": [{'address': address, 'reason': reason}
+                          for address, reason in tracer.decompressors.rejected.items()],
+        "decompressions": tracer.decompressions,
         "stop_reason": tracer.stop_reason,
         "unicorn_error": error,
         "stop_registers": tracer.stop_registers,

@@ -218,4 +218,3 @@ class Diagnostics:
         temporary = self.directory / 'latest-state.json.tmp'
         temporary.write_text(json.dumps(state, indent=2), encoding='ascii')
         temporary.replace(self.directory / 'latest-state.json')
-        self.record('checkpoint', **state)

@@ -1,17 +1,11 @@
-import hashlib
 import json
 import os
 import struct
 import sys
-from datetime import datetime, timezone
 from pathlib import Path
 
 import pefile
 from .binary import read_u32
-
-
-def digest(data):
-    return hashlib.sha256(data).hexdigest()
 
 
 def extract_module(data):
@@ -22,17 +16,14 @@ def extract_module(data):
         exports = []
         for item in getattr(getattr(pe, "DIRECTORY_ENTRY_EXPORT", None), "symbols", []):
             name = item.name.decode("ascii") if item.name else None
-            forwarder = item.forwarder.decode("ascii") if item.forwarder else None
-            record = {"name": name, "ordinal": item.ordinal, "rva": item.address,
-                      "forwarder": forwarder}
-            if name and name.startswith(("Nt", "Zw")) and not forwarder:
+            record = {"name": name, "ordinal": item.ordinal}
+            if name and name.startswith(("Nt", "Zw")) and not item.forwarder:
                 code = pe.get_data(item.address, 32)
 
                 if code[:4] == b"\x4c\x8b\xd1\xb8" and b"\x0f\x05" in code[8:]:
                     record["syscall"] = read_u32(code, 4)
             exports.append(record)
-        return {"sha256": digest(data), "size": len(data), "machine": "AMD64",
-                "timestamp": pe.FILE_HEADER.TimeDateStamp, "exports": exports}
+        return {"exports": exports}
 
 
 def parse_api_set(data):
@@ -73,7 +64,7 @@ def parse_api_set(data):
 
 def capture(output):
     if sys.platform != "win32" or struct.calcsize("P") != 8:
-        raise ValueError("capture requires 64-bit Python on Windows; consumption does not")
+        raise ValueError("capture requires Windows x64 Python")
     import winreg
     with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
                         r"SOFTWARE\Microsoft\Windows NT\CurrentVersion") as key:
@@ -81,12 +72,12 @@ def capture(output):
             return winreg.QueryValueEx(key, name)[0]
         version = {"major": value("CurrentMajorVersionNumber"),
                    "minor": value("CurrentMinorVersionNumber"),
-                   "build": int(value("CurrentBuildNumber")), "ubr": value("UBR"),
+                   "build": int(value("CurrentBuildNumber")),
                    "platform_id": 2, "service_pack_major": 0, "service_pack_minor": 0,
                    "product_type": sys.getwindowsversion().product_type,
                    "suite_mask": sys.getwindowsversion().suite_mask}
     system32 = Path(os.environ["SystemRoot"]) / "System32"
-    modules, skipped = {}, []
+    modules = {}
     ntdll = None
     api_sets = {}
     paths = sorted(system32.glob("*.dll"), key=lambda p: p.name.lower())
@@ -101,20 +92,11 @@ def capture(output):
                     section = next(s for s in schema.sections if s.Name.rstrip(b"\0") == b".apiset")
                     api_sets = parse_api_set(section.get_data())
             modules[path.name.lower()] = module
-        except (OSError, ValueError, pefile.PEFormatError, UnicodeError) as exc:
-            skipped.append({"module": path.name, "reason": str(exc)})
+        except (OSError, ValueError, pefile.PEFormatError, UnicodeError):
+            continue
     if ntdll is None:
         raise ValueError("could not capture AMD64 ntdll.dll")
-
-
-    with pefile.PE(data=ntdll) as pe:
-        fixed = pe.VS_FIXEDFILEINFO[0]
-        file_version = [fixed.FileVersionMS >> 16, fixed.FileVersionMS & 0xffff,
-                        fixed.FileVersionLS >> 16, fixed.FileVersionLS & 0xffff]
-    version["ntdll_file_version"] = file_version
-    document = {"schema": 1, "created_utc": datetime.now(timezone.utc).isoformat(),
-                "windows": version, "modules": modules, "skipped": skipped, "api_sets": api_sets,
-                "clean_ntdll": {"file": "ntdll.dll", "sha256": digest(ntdll)}}
+    document = {"schema": 1, "windows": version, "modules": modules, "api_sets": api_sets}
     output.mkdir(parents=True, exist_ok=False)
     (output / "ntdll.dll").write_bytes(ntdll)
     (output / "catalog.json").write_text(json.dumps(document, indent=2), encoding="utf-8")
@@ -137,7 +119,6 @@ class Catalog:
     def __init__(self, directory):
         self.directory = Path(directory)
         raw = (self.directory / "catalog.json").read_bytes()
-        self.sha256 = digest(raw)
         self.document = json.loads(raw)
         if self.document.get("schema") != 1:
             raise ValueError("unsupported catalog schema")
@@ -147,10 +128,6 @@ class Catalog:
                 raise ValueError(f"invalid Windows {field}")
         self.modules = self.document["modules"]
         raw_ntdll = (self.directory / "ntdll.dll").read_bytes()
-        expected = self.document["clean_ntdll"]["sha256"]
-        if digest(raw_ntdll) != expected or self.modules["ntdll.dll"]["sha256"] != expected:
-            raise ValueError("clean ntdll hash does not match catalog")
-
         self.ntdll_bytes = raw_ntdll
 
     def exports(self, name):
@@ -162,7 +139,7 @@ class Catalog:
             visited.add(name)
             name = self.document["api_sets"][name]
         if name not in self.modules:
-            raise ValueError(f"module not captured in catalog: {name}")
+            raise ValueError(f"module missing from catalog: {name}")
         return self.modules[name]["exports"]
 
     def syscall_catalog(self):

@@ -45,6 +45,7 @@ class TraceHooks:
         self.callbacks = (tracer.on_block, tracer.on_image_write)
         points = ({tracer.entry_address} | tracer.stack_copy_candidates
                   | set(tracer.discovered_crc_loops)
+                  | set(tracer.decompressors.candidates)
                   | {address for address in tracer.synthetic_import_targets if tracer.in_module(address)})
         self.context, context_address, block_address, write_address = _hook_filter.create(
             tracer.image_start, tracer.image_end,

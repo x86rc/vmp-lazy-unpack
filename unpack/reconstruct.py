@@ -1,6 +1,4 @@
-import hashlib
 import struct
-from collections import Counter
 import pefile
 from capstone import CS_ARCH_X86, CS_MODE_64, Cs
 from capstone.x86 import X86_OP_MEM, X86_OP_REG, X86_REG_RIP
@@ -61,7 +59,7 @@ def extend_import_storage(output, pe, storage, content, characteristics):
               pe.OPTIONAL_HEADER.SizeOfInitializedData + raw_size - section.SizeOfRawData)
     return {**storage, "section_name": name.decode("ascii", "replace"),
             "previous_section_name": original_name.decode("ascii", "replace"),
-            "virtual_size": virtual_size, "raw_size": raw_size, "added_section": False}
+            "virtual_size": virtual_size, "raw_size": raw_size}
 
 
 def identity(record):
@@ -116,11 +114,9 @@ def extra_imports(pe, records, section_rva):
     return bytes(content), descriptor_size, slots
 
 
-def reconstruct_imports(data, report, restored_ranges):
+def reconstruct_imports(data, report, restored_ranges, *, scan_wrappers=True):
 
-    input_sha256 = hashlib.sha256(data).hexdigest()
     data, storage = prepare_import_storage(data)
-    header_expansion = {"bytes_added": 0}
     pe = parse_pe(data)
     base = pe.OPTIONAL_HEADER.ImageBase
     if number(report["image_base"]) != base:
@@ -153,12 +149,12 @@ def reconstruct_imports(data, report, restored_ranges):
             if category == "recovered_iat" and not restored(slot):
                 continue
             if category == "recovered_iat" and number(record["emu_address"]) not in bootstrap_targets.get(identity(record), set()):
-                raise BuildError("scan-only import: bootstrap identity or pointer mismatch")
+                raise BuildError("bootstrap import mismatch")
             offset = file_offset(pe, slot, 8)
             if read_u64(data, offset) != number(record["emu_address"]):
-                raise BuildError("observed import pointer does not match dump")
+                raise BuildError("import pointer mismatch")
             if slot in selected and identity(selected[slot][0]) != identity(record):
-                raise BuildError("conflicting import identities for one slot")
+                raise BuildError("conflicting imports at slot")
             selected[slot] = (record, category)
     encoded = {}
     for record in report.get("encoded_imports", []):
@@ -169,7 +165,7 @@ def reconstruct_imports(data, report, restored_ranges):
         offset = file_offset(pe, slot, 8)
         stored = read_u64(data, offset)
         if stored != number(record["encoded_value"]) or (stored + key) & 0xffffffffffffffff != number(record["emu_address"]):
-            raise BuildError("encoded import value does not match recovery evidence")
+            raise BuildError("encoded import mismatch")
         metadata = file_offset(pe, number(record["record_rva"]), 12)
         _, actual_slot, actual_key = struct.unpack_from("<IIi", data, metadata)
         if (actual_slot, actual_key) != (slot, key):
@@ -181,7 +177,7 @@ def reconstruct_imports(data, report, restored_ranges):
         encoded[slot] = record
         selected.pop(slot, None)
     if not selected and not encoded:
-        raise BuildError("no verified import slots")
+        raise BuildError("no imports recovered")
     extras = {}
     for record in [item[0] for item in selected.values()] + list(encoded.values()):
         key = identity(record)
@@ -230,9 +226,13 @@ def reconstruct_imports(data, report, restored_ranges):
             category = "runtime_duplicate" if identity(record) in bootstrap else "runtime_only"
         targets[base + slot] = (destination, category, record)
     patches = scan_import_references(pe, image, targets) if targets else []
-    wrapper_patches, wrapper_report = resolve_import_wrappers(
-        pe, image, list(encoded.values()), destinations, restored_ranges)
-    patches = sorted(patches + wrapper_patches, key=lambda p: p["instruction_va"])
+    if scan_wrappers:
+        wrapper_patches, wrapper_report = resolve_import_wrappers(
+            pe, image, list(encoded.values()), destinations, restored_ranges)
+        patches = sorted(patches + wrapper_patches, key=lambda p: p["instruction_va"])
+    else:
+        wrapper_report = {'candidate_count': 0, 'resolved_count': 0, 'rejected': {},
+                          'skipped': 'wrapper emulation disabled'}
 
     end = -1
     for patch in patches:
@@ -297,17 +297,13 @@ def reconstruct_imports(data, report, restored_ranges):
         if thunk + 6 + read_i32(output, offset + 2) != number(patch["iat_va"]):
             raise BuildError("import slot thunk IAT target mismatch")
     return output, serializable_report({
-        "input_sha256": input_sha256,
-        "header_expansion": header_expansion,
         "import_storage": section,
         "exceptions": exception_report,
-        "output_sha256": hashlib.sha256(output).hexdigest(),
-        "new_section": None, "import_count": len(expected),
-        "extra_import_count": len(extras), "patch_count": len(patches),
-        "patch_categories": dict(Counter(p["category"] for p in patches)),
+        "import_count": len(expected),
+        "extra_import_count": len(extras),
         "patches": patches,
-        "encoded_slot_patch_count": len(encoded_patches), "encoded_slot_patches": encoded_patches,
-        "plain_slot_patch_count": len(plain_patches), "plain_slot_patches": plain_patches,
+        "encoded_slot_patches": encoded_patches,
+        "plain_slot_patches": plain_patches,
         "import_thunk_count": len(thunks),
         "wrapper_resolution": wrapper_report,
     })
@@ -412,7 +408,7 @@ def scan_import_references(
             displacement = new_target - (instruction.address + instruction.size)
             if not -(1 << 31) <= displacement < (1 << 31):
                 raise BuildError(
-                    f"new IAT target is outside rel32 range at 0x{instruction.address:X}"
+                    f"iat target out of rel32 range at 0x{instruction.address:X}"
                 )
             patch_rva = instruction_rva + instruction.disp_offset
             patch_file_offset = file_offset(pe, patch_rva, 4)

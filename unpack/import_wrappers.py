@@ -243,5 +243,4 @@ def resolve_import_wrappers(pe, image, records, destinations, restored_ranges):
             safe.append(patch)
     patches = safe
     return patches, {'candidate_count': candidates, 'resolved_count': len(patches),
-                     'rejected': dict(rejected), 'rejected_candidates': rejected_candidates,
-                     'states_per_candidate': 3}
+                     'rejected': dict(rejected), 'rejected_candidates': rejected_candidates}

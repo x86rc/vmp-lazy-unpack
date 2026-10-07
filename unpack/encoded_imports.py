@@ -20,7 +20,7 @@ def find_all(data, pattern):
         cursor += 1
 
 
-def recover_encoded_imports(image, image_base, module_bases, catalog, string_keys):
+def recover_encoded_imports(image, image_base, module_bases, catalog, string_keys, *, require_initialized=True):
     tables = []
     slots = {}
     seen_tables = set()
@@ -62,13 +62,14 @@ def recover_encoded_imports(image, image_base, module_bases, catalog, string_key
 
                             expected = module_base + 0x40000 + (ordinal - 1) * 16
                             stored = read_u64(image, slot)
-                            if (stored + key) & 0xffffffffffffffff != expected:
+                            if require_initialized and (stored + key) & 0xffffffffffffffff != expected:
                                 break
                             records.append({"module": module, "symbol": symbol, "slot_rva": slot,
                                             "slot_va": image_base + slot, "emu_address": expected,
                                             "encoded_value": stored, "key": key,
                                             "record_rva": cursor, "table_rva": table_rva,
-                                            "source": "encoded_import_table", "encoding": "subtract_signed_i32"})
+                                            "source": "encoded_import_table" if require_initialized else "static_import_metadata",
+                                            "encoding": "subtract_signed_i32"})
                             cursor += 12
                         if not valid:
                             continue

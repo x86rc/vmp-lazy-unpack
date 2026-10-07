@@ -25,8 +25,16 @@ For decent speeds its recommended to install Microsoft C++ Build Tools so the C 
 
 ## Usage
 
+For normal unpacking + import fixups run:
+
 ```powershell
 py -m unpack "C:\path\file.exe"
+```
+
+To fix imports on an already unpacked bin:
+
+```powershell
+py -m unpack "C:\path\file.bin" --imports_only
 ```
 
 ## Limitations

@@ -1,6 +1,3 @@
-import hashlib
-
-
 def number(value):
     return int(value, 0) if isinstance(value, str) else int(value)
 
@@ -16,7 +13,7 @@ def import_slots(pe):
     return result
 
 
-def import_address_metadata(pe, data, report):
+def import_address_metadata(pe, report):
     base = pe.OPTIONAL_HEADER.ImageBase
     if number(report['image_base']) != base:
         raise ValueError('import report and output image bases differ')
@@ -43,4 +40,4 @@ def import_address_metadata(pe, data, report):
                 raise ValueError(f'conflicting runtime import addresses for {module} {symbol}')
             entries.append(dict(symbol=symbol, iat_rva=hex(item.address - base),
                                 iat_va=hex(item.address), runtime_address=hex(next(iter(targets)))))
-    return dict(image_base=hex(base), output_sha256=hashlib.sha256(data).hexdigest(), imports=imports)
+    return dict(image_base=hex(base), imports=imports)
