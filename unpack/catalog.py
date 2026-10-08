@@ -11,7 +11,7 @@ from .binary import read_u32
 def extract_module(data):
     with pefile.PE(data=data, fast_load=True) as pe:
         if pe.FILE_HEADER.Machine != 0x8664 or pe.OPTIONAL_HEADER.Magic != 0x20B:
-            raise ValueError("not an AMD64 PE32+ DLL")
+            raise ValueError("expected windows x64 binary")
         pe.parse_data_directories(directories=[0])
         exports = []
         for item in getattr(getattr(pe, "DIRECTORY_ENTRY_EXPORT", None), "symbols", []):
@@ -29,19 +29,19 @@ def extract_module(data):
 def parse_api_set(data):
 
     if len(data) < 28:
-        raise ValueError("truncated API-set namespace")
+        raise ValueError("truncated api set namespace")
     version, size, _, count, entries, _, _ = struct.unpack_from("<7I", data)
     if version != 6 or not 28 <= size <= len(data):
-        raise ValueError("unsupported or truncated API-set namespace")
+        raise ValueError("unsupported or truncated api set namespace")
 
     def checked(offset, length):
         if offset < 0 or length < 0 or offset + length > size:
-            raise ValueError("API-set field outside namespace")
+            raise ValueError("api set field outside namespace")
         return data[offset:offset + length]
 
     def string(offset, length):
         if length % 2:
-            raise ValueError("invalid API-set string length")
+            raise ValueError("invalid api set string length")
         return checked(offset, length).decode("utf-16-le").lower()
 
     checked(entries, count * 24)
@@ -56,7 +56,7 @@ def parse_api_set(data):
             if alias_length == 0 and host_length:
                 defaults.add(string(host, host_length))
         if len(defaults) > 1:
-            raise ValueError(f"ambiguous API-set default: {contract}")
+            raise ValueError(f"multiple api set defaults for {contract}")
         if defaults:
             result[contract] = defaults.pop()
     return result
@@ -64,7 +64,7 @@ def parse_api_set(data):
 
 def capture(output):
     if sys.platform != "win32" or struct.calcsize("P") != 8:
-        raise ValueError("capture requires Windows x64 Python")
+        raise ValueError("capture requires windows x64 python")
     import winreg
     with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
                         r"SOFTWARE\Microsoft\Windows NT\CurrentVersion") as key:
@@ -95,7 +95,7 @@ def capture(output):
         except (OSError, ValueError, pefile.PEFormatError, UnicodeError):
             continue
     if ntdll is None:
-        raise ValueError("could not capture AMD64 ntdll.dll")
+        raise ValueError("could not capture x64 ntdll.dll")
     document = {"schema": 1, "windows": version, "modules": modules, "api_sets": api_sets}
     output.mkdir(parents=True, exist_ok=False)
     (output / "ntdll.dll").write_bytes(ntdll)
@@ -110,7 +110,7 @@ def find_or_capture_catalog(roots):
             return directory
     directory = roots[-1] / "catalog"
     if directory.exists():
-        raise ValueError(f"Incomplete catalog: {directory}")
+        raise ValueError(f"incomplete catalog {directory}")
     capture(directory)
     return directory
 
@@ -125,7 +125,7 @@ class Catalog:
         self.windows = self.document["windows"]
         for field in ("major", "minor", "build"):
             if type(self.windows[field]) is not int or not 0 <= self.windows[field] <= 65535:
-                raise ValueError(f"invalid Windows {field}")
+                raise ValueError(f"invalid windows {field}")
         self.modules = self.document["modules"]
         raw_ntdll = (self.directory / "ntdll.dll").read_bytes()
         self.ntdll_bytes = raw_ntdll
@@ -135,11 +135,11 @@ class Catalog:
         visited = set()
         while name not in self.modules and name in self.document.get("api_sets", {}):
             if name in visited:
-                raise ValueError("cyclic API-set mapping")
+                raise ValueError("api set mapping cycle")
             visited.add(name)
             name = self.document["api_sets"][name]
         if name not in self.modules:
-            raise ValueError(f"module missing from catalog: {name}")
+            raise ValueError(f"module missing from catalog {name}")
         return self.modules[name]["exports"]
 
     def syscall_catalog(self):

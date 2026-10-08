@@ -120,7 +120,7 @@ def reconstruct_imports(data, report, restored_ranges, *, scan_wrappers=True):
     pe = parse_pe(data)
     base = pe.OPTIONAL_HEADER.ImageBase
     if number(report["image_base"]) != base:
-        raise BuildError("import report and image bases differ")
+        raise BuildError("import report image base mismatch")
     if report.get("unresolved_loader_queries"):
         raise BuildError("unresolved loader queries")
     if not restored_ranges:
@@ -133,7 +133,7 @@ def reconstruct_imports(data, report, restored_ranges, *, scan_wrappers=True):
         slot = number(record["slot_rva"])
         key = identity(record)
         if actual.get(slot) != key:
-            raise BuildError("bootstrap import does not match PE metadata")
+            raise BuildError("bootstrap import differs from binary metadata")
         bootstrap.setdefault(key, base + slot)
         if "emu_address" in record:
             bootstrap_targets.setdefault(key, set()).add(number(record["emu_address"]))
@@ -169,7 +169,7 @@ def reconstruct_imports(data, report, restored_ranges, *, scan_wrappers=True):
         metadata = file_offset(pe, number(record["record_rva"]), 12)
         _, actual_slot, actual_key = struct.unpack_from("<IIi", data, metadata)
         if (actual_slot, actual_key) != (slot, key):
-            raise BuildError("encoded import metadata does not match dump")
+            raise BuildError("encoded import metadata differs from dump")
         if key == 0 and slot in selected and identity(selected[slot][0]) == identity(record):
             continue
         if slot in encoded and encoded[slot] != record:
@@ -185,10 +185,10 @@ def reconstruct_imports(data, report, restored_ranges, *, scan_wrappers=True):
             extras.setdefault(key, record)
     for slot, key in actual.items():
         if slot in encoded:
-            raise BuildError("encoded slot overlaps an existing PE import")
+            raise BuildError("encoded slot overlaps existing import")
         if slot in selected:
             if identity(selected[slot][0]) != key:
-                raise BuildError("observed slot conflicts with an existing PE import")
+                raise BuildError("observed slot conflicts with existing import")
         else:
             selected[slot] = (dict(module=key[0], symbol=key[1], slot_rva=slot,
                                    emu_address=read_u64(data, file_offset(pe, slot, 8))), 'bootstrap')
@@ -204,7 +204,7 @@ def reconstruct_imports(data, report, restored_ranges, *, scan_wrappers=True):
     plain = {slot: record for slot, (record, _) in selected.items()}
     for slot, (record, _) in selected.items():
         if slot in actual and actual[slot] != identity(record):
-            raise BuildError("observed slot conflicts with an existing PE import")
+            raise BuildError("observed slot conflicts with existing import")
     thunks = {}
     for record in list(encoded.values()) + list(plain.values()):
         key = identity(record)
@@ -214,7 +214,7 @@ def reconstruct_imports(data, report, restored_ranges, *, scan_wrappers=True):
         address = base + section_rva + len(content)
         displacement = destinations[key] - (address + 6)
         if not -(1 << 31) <= displacement < (1 << 31):
-            raise BuildError("import thunk exceeds RIP-relative range")
+            raise BuildError("import thunk exceeds relative address range")
         content.extend(b"\xff\x25" + encode_i32(displacement))
         thunks[key] = address
     targets = {}
@@ -271,7 +271,7 @@ def reconstruct_imports(data, report, restored_ranges, *, scan_wrappers=True):
     if verified_slots != expected:
         missing = [(hex(slot), key) for slot, key in expected.items() if verified_slots.get(slot) != key]
         unexpected = [(hex(slot), key) for slot, key in verified_slots.items() if expected.get(slot) != key]
-        raise BuildError(f"rebuilt import mismatch: {len(missing)} missing or changed {missing[:8]}; "
+        raise BuildError(f"rebuilt import mismatch with {len(missing)} missing or changed {missing[:8]} and "
                          f"{len(unexpected)} unexpected {unexpected[:8]}")
     write_u32(output, verified.OPTIONAL_HEADER.get_field_absolute_offset("CheckSum"), verified.generate_checksum())
     output = bytes(output)
@@ -295,7 +295,7 @@ def reconstruct_imports(data, report, restored_ranges, *, scan_wrappers=True):
         if (value + patch["key"]) & 0xffffffffffffffff != thunk or output[offset:offset + 2] != b"\xff\x25":
             raise BuildError("import slot thunk verification failed")
         if thunk + 6 + read_i32(output, offset + 2) != number(patch["iat_va"]):
-            raise BuildError("import slot thunk IAT target mismatch")
+            raise BuildError("import slot thunk iat target mismatch")
     return output, serializable_report({
         "import_storage": section,
         "exceptions": exception_report,

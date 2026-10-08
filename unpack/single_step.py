@@ -45,14 +45,14 @@ class SingleStep:
         matches = [(i, row) for i, row in enumerate(struct.iter_unpack('<III', table))
                    if row[0] <= rip - self.base < row[1]]
         if len(matches) != 1:
-            raise ValueError('single-step address does not have one runtime function')
+            raise ValueError('single step address must match exactly one runtime function')
         index, (begin, end, unwind) = matches[0]
         version_flags, prologue, count, frame = uc.mem_read(self.base + unwind, 4)
         if version_flags & 7 != 1 or version_flags >> 3 not in (1, 3):
-            raise ValueError('single-step requires an unchained exception handler')
+            raise ValueError('single step requires an unchained exception handler')
         frame_register = frame & 15
         if frame_register not in (3, 5, 6, 7, 12, 13, 14, 15) or rip - self.base < begin + prologue:
-            raise ValueError('single-step requires an established nonvolatile frame register')
+            raise ValueError('single step requires an established nonvolatile frame register')
         frame_names = ('rax', 'rcx', 'rdx', 'rbx', 'rsp', 'rbp', 'rsi', 'rdi',
                        'r8', 'r9', 'r10', 'r11', 'r12', 'r13', 'r14', 'r15')
         establisher = uc.reg_read(getattr(ux, 'UC_X86_REG_' + frame_names[frame_register].upper())) - (frame >> 4) * 16

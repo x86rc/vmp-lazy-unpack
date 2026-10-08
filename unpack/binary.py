@@ -7,7 +7,7 @@ def _buffer_offset(data, offset, size):
     if offset < 0:
         offset += len(view)
     if offset < 0 or offset + size > len(view):
-        raise ValueError(f"Integer read/write exceeds buffer: offset={offset}, size={size}")
+        raise ValueError(f"integer access exceeds buffer at offset {offset} with size {size}")
     return view, offset
 
 

@@ -16,7 +16,7 @@ def write_pe_structure(data, offset, layout, **fields):
     record.__unpack__(bytes(size))
     for name, value in fields.items():
         if name not in record.__field_offsets__:
-            raise ValueError(f"Unknown {record.name} field: {name}")
+            raise ValueError(f"unknown {record.name} field {name}")
         setattr(record, name, value)
     data[offset:offset + size] = record.__pack__()
 
@@ -30,7 +30,7 @@ def align_up(value, alignment):
 def parse_pe(data):
     pe = pefile.PE(data=data, fast_load=False)
     if pe.FILE_HEADER.Machine != 0x8664 or pe.OPTIONAL_HEADER.Magic != 0x20B:
-        raise ValueError("only AMD64 PE32+ is supported")
+        raise ValueError("only windows x64 supported")
     size = pe.OPTIONAL_HEADER.SizeOfImage
     if size <= 0:
         raise ValueError("invalid image size")
@@ -38,11 +38,11 @@ def parse_pe(data):
     if not 0 < headers <= min(len(data), size):
         raise ValueError("invalid or truncated headers")
     if len(pe.OPTIONAL_HEADER.DATA_DIRECTORY) < 16:
-        raise ValueError("a full PE data-directory table is required")
+        raise ValueError("full data directory table required")
     if len(pe.sections) != pe.FILE_HEADER.NumberOfSections or not pe.sections:
         raise ValueError("missing or truncated section table")
     if any(section.get_file_offset() + 40 > headers for section in pe.sections):
-        raise ValueError("section table extends past SizeOfHeaders")
+        raise ValueError("section table exceeds header size")
     align_up(0, pe.OPTIONAL_HEADER.FileAlignment)
     align_up(0, pe.OPTIONAL_HEADER.SectionAlignment)
     ranges = []
@@ -50,9 +50,9 @@ def parse_pe(data):
         start = section.VirtualAddress
         end = start + max(section.Misc_VirtualSize, section.SizeOfRawData)
         if start < headers or end > size:
-            raise ValueError("section lies outside image or overlaps headers")
+            raise ValueError("section outside image or overlapping headers")
         if any(start < right and left < end for left, right in ranges):
-            raise ValueError("overlapping sections are not supported")
+            raise ValueError("overlapping sections not supported")
         ranges.append((start, end))
         if section.SizeOfRawData:
             if section.PointerToRawData < headers or section.PointerToRawData + section.SizeOfRawData > len(data):
@@ -77,4 +77,4 @@ def file_offset(pe, rva, size):
         delta = rva - section.VirtualAddress
         if 0 <= delta and delta + size <= section.SizeOfRawData:
             return section.PointerToRawData + delta
-    raise ValueError(f"RVA 0x{rva:X} is not backed by section data")
+    raise ValueError(f"image offset 0x{rva:X} has no section data")

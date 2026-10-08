@@ -37,12 +37,12 @@ class FileModel:
         if record is None or record["kind"] != "section":
             raise ValueError("invalid section handle")
         if offset != 0:
-            raise ValueError("nonzero section offsets are not modeled")
+            raise ValueError("nonzero section offsets not supported")
         size = align_up(len(record["data"]), 4096)
         if sum(view["size"] for view in self.views.values()) + size > 512 * 1024 * 1024:
-            raise ValueError("captured-file view budget exceeded")
+            raise ValueError("file mapping limit exceeded")
         if requested_size and requested_size != size:
-            raise ValueError("partial section views are not modeled")
+            raise ValueError("partial section views not supported")
         address = self.next_view
         self.next_view += align_up(size, 65536) + 65536
         self.uc.mem_map(address, size)

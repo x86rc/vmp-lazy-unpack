@@ -83,21 +83,21 @@ def validate_decoder(candidate):
         try:
             uc.emu_start(candidate.address, sentinel, count=2000000, timeout=1000000)
         except UcError as exc:
-            return False, f'conformance memory/instruction error: {exc}'
+            return False, f'decoder test failed {exc}'
         if failure:
             return False, failure[0]
         if uc.reg_read(ux.UC_X86_REG_RIP) != sentinel:
-            return False, 'conformance probe did not return'
+            return False, 'decoder test did not return'
         if uc.reg_read(ux.UC_X86_REG_RAX) != 0 or uc.reg_read(ux.UC_X86_REG_RSP) != sp + 8:
             return False, 'decoder status or return stack mismatch'
         if any(uc.reg_read(reg) != value for reg, value in expected.items()):
-            return False, 'callee-saved register mismatch'
+            return False, 'callee saved register mismatch'
         if uc.reg_read(ux.UC_X86_REG_EFLAGS) & 0x400:
             return False, 'direction flag not restored'
         if bytes(uc.mem_read(destination, len(payload))) != payload:
             return False, 'decoded output mismatch'
         if read_u64(uc.mem_read(counts, 8)) != len(packed) or read_u64(uc.mem_read(counts + 8, 8)) != len(payload):
-            return False, 'processed-size mismatch'
+            return False, 'processed size mismatch'
     return True, None
 
 
@@ -115,14 +115,14 @@ def decode_call(uc, candidate, image_start, image_end, destination_ranges):
     args = uc.mem_read(sp + 0x28, 24)
     destination, output_limit, output_processed = (read_u64(args, offset) for offset in (0, 8, 16))
     if not image_start <= source < image_end or not image_start <= return_address < image_end:
-        raise ValueError('source or return outside image')
+        raise ValueError('source or return address outside image')
     section = next(((start, end, name) for start, end, name in destination_ranges if start <= destination < end), None)
     if section is None:
-        raise ValueError('destination is not a packed section')
+        raise ValueError('destination outside packed sections')
     descriptor = uc.mem_read(state, 24)
     lc, lp, pb = (read_u32(descriptor, offset) for offset in (0, 4, 8))
     if lc > 8 or lp > 4 or pb > 4 or lc + lp > 4:
-        raise ValueError('unsupported LZMA properties')
+        raise ValueError('unsupported lzma settings')
     capacity = min(section[1] - destination, output_limit)
     source_size = min(image_end - source, input_limit)
     if capacity <= 0 or source_size < 5:
@@ -130,7 +130,7 @@ def decode_call(uc, candidate, image_start, image_end, destination_ranges):
     probs = read_u64(descriptor, 16)
     prob_size = 2 * (BASE_PROBABILITIES + (LITERAL_PROBABILITIES << (lc + lp)))
     if probs < image_end and image_start < probs + prob_size:
-        raise ValueError('image-backed probability workspace requires Unicorn')
+        raise ValueError('probability buffer overlapping image requires unicorn')
     writes = ((destination, destination + capacity), (input_processed, input_processed + 8),
               (output_processed, output_processed + 8), (probs, probs + prob_size))
     protected = ((state, state + 24),
@@ -141,7 +141,7 @@ def decode_call(uc, candidate, image_start, image_end, destination_ranges):
         if not start or not any(left <= start < end <= right + 1 and perms & UC_PROT_WRITE for left, right, perms in regions):
             raise ValueError('decoder output or scratch is not writable')
         if any(start < right and left < end for left, right in protected):
-            raise ValueError('decoder buffers overlap input, state, code or arguments')
+            raise ValueError('decoder buffers overlap state or code or arguments')
     for index, (start, end) in enumerate(writes):
         if any(start < right and left < end for left, right in writes[index + 1:]):
             raise ValueError('decoder output buffers overlap')
@@ -149,9 +149,9 @@ def decode_call(uc, candidate, image_start, image_end, destination_ranges):
     compressed = bytes(uc.mem_read(source, source_size))
     output = decoder.decompress(compressed, max_length=capacity + 1)
     if not decoder.eof or len(output) > capacity:
-        raise ValueError('LZMA stream exceeds available buffers')
+        raise ValueError('lzma stream exceeds available buffers')
     if len(output) >= output_limit:
-        raise ValueError('output-limited decoding requires Unicorn')
+        raise ValueError('output limited decoding requires unicorn')
     consumed = len(compressed) - len(decoder.unused_data)
     if any(start < source + consumed and source < end for start, end in writes):
         raise ValueError('decoder output overlaps compressed input')

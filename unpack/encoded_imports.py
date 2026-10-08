@@ -77,7 +77,7 @@ def recover_encoded_imports(image, image_base, module_bases, catalog, string_key
                         for record in records:
                             slot = record["slot_rva"]
                             if slot in slots and (slots[slot]["emu_address"], slots[slot]["key"]) != (record["emu_address"], record["key"]):
-                                raise ValueError("conflicting encoded-import evidence")
+                                raise ValueError("conflicting encoded imports")
                             slots.setdefault(slot, record)
                         tables.append({"rva": table_rva, "end_rva": cursor + 4,
                                        "module": module, "string_key": string_key, "count": len(records)})

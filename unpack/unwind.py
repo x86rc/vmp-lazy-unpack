@@ -22,16 +22,16 @@ def repair_exception_tables(data):
 
     def code_range_error(begin, end):
         if begin >= end:
-            return f"end RVA 0x{end:X} is not greater than the start"
+            return f"end image offset 0x{end:X} not greater than start"
         section = pe.get_section_by_rva(begin)
         if section is None:
-            return "start is outside image sections"
+            return "start outside image sections"
         name = section.Name.rstrip(b'\0').decode('ascii', errors='replace')
         if not section.Characteristics & 0x20000000:
-            return f"section {name!r} is not executable (characteristics 0x{section.Characteristics:X})"
+            return f"section {name!r} not executable with characteristics 0x{section.Characteristics:X}"
         section_end = section.VirtualAddress + max(section.Misc_VirtualSize, section.SizeOfRawData)
         if end > section_end:
-            return f"end RVA 0x{end:X} exceeds section {name!r} ending at 0x{section_end:X}"
+            return f"end image offset 0x{end:X} exceeds section {name!r} ending at 0x{section_end:X}"
         return None
 
     def row(blob, offset=0, record_rva=None):
@@ -39,13 +39,13 @@ def repair_exception_tables(data):
         begin, end, unwind = result
         reason = code_range_error(begin, end)
         if reason is None and not unwind:
-            reason = "unwind RVA is zero"
+            reason = "unwind image offset zero"
         if reason is None and unwind % 4:
-            reason = f"unwind RVA 0x{unwind:X} is not four-byte aligned"
+            reason = f"unwind image offset 0x{unwind:X} not aligned to 4 bytes"
         if reason:
-            location = f", record RVA 0x{record_rva:X}" if record_rva is not None else ""
-            raise ValueError(f"invalid runtime function at RVA 0x{begin:X} "
-                             f"(end 0x{end:X}, unwind 0x{unwind:X}{location}): {reason}")
+            location = f" record image offset 0x{record_rva:X}" if record_rva is not None else ""
+            raise ValueError(f"invalid runtime function at image offset 0x{begin:X} "
+                             f"end 0x{end:X} unwind 0x{unwind:X}{location} because {reason}")
         return result
 
     table = read(directory.VirtualAddress, directory.Size)
@@ -56,16 +56,16 @@ def repair_exception_tables(data):
         path = set()
         while unwind not in visited:
             if unwind in path:
-                raise ValueError(f"unwind chain cycle at RVA 0x{unwind:X}")
+                raise ValueError(f"unwind chain cycle at image offset 0x{unwind:X}")
             path.add(unwind)
             version_flags, prologue, count, frame = read(unwind, 4)
             version, flags = version_flags & 7, version_flags >> 3
             if version not in (1, 2):
-                raise ValueError(f"unsupported unwind version {version} at RVA 0x{unwind:X}")
+                raise ValueError(f"unsupported unwind version {version} at image offset 0x{unwind:X}")
             if flags > 7 or flags & 4 and flags & 3:
-                raise ValueError(f"invalid unwind flags at RVA 0x{unwind:X}")
+                raise ValueError(f"invalid unwind flags at image offset 0x{unwind:X}")
             if (frame & 15) not in (0, 3, 5, 6, 7, 12, 13, 14, 15) or not frame & 15 and frame >> 4:
-                raise ValueError(f"invalid unwind frame register at RVA 0x{unwind:X}")
+                raise ValueError(f"invalid unwind frame register at image offset 0x{unwind:X}")
             codes = read(unwind + 4, ((count + 1) & ~1) * 2) if count else b""
             index = 0
             previous = 255
@@ -78,10 +78,10 @@ def repair_exception_tables(data):
                 if (slots is None or index + slots > count or operation == 1 and info > 1
                         or operation == 3 and not frame & 15
                         or operation == 10 and info > 1 or operation == 6 and version != 2):
-                    raise ValueError(f"invalid unwind opcode at RVA 0x{unwind:X}")
+                    raise ValueError(f"invalid unwind opcode at image offset 0x{unwind:X}")
                 if operation != 6:
                     if offset > previous:
-                        raise ValueError(f"unordered unwind codes at RVA 0x{unwind:X}")
+                        raise ValueError(f"unordered unwind codes at image offset 0x{unwind:X}")
                     previous = offset
                     prologue_mismatch |= offset > prologue
                 index += slots
@@ -95,8 +95,8 @@ def repair_exception_tables(data):
                     handler = read_u32(read(tail, 4))
                     reason = code_range_error(handler, handler + 1)
                     if reason:
-                        raise ValueError(f"invalid exception handler RVA 0x{handler:X} "
-                                         f"(unwind RVA 0x{unwind:X}): {reason}")
+                        raise ValueError(f"invalid exception handler image offset 0x{handler:X} "
+                                         f"unwind image offset 0x{unwind:X} because {reason}")
                     handler_section = pe.get_section_by_rva(tail)
                     protected.append((tail, handler_section.VirtualAddress + max(
                         handler_section.Misc_VirtualSize, handler_section.SizeOfRawData)))

@@ -10,11 +10,11 @@ def discover_crc_loops(pe):
 def accelerate_crc(uc, address, candidate, image_start, image_end, file_ranges=()):
     raw = candidate["bytes"]
     if candidate.get("proof_address", address) != address:
-        raise ValueError("CRC candidate address mismatch")
+        raise ValueError("crc candidate address mismatch")
     code_ranges = candidate.get('code_ranges', [(address, raw)])
     for start, code in code_ranges:
         if bytes(uc.mem_read(start, len(code))) != code:
-            raise ValueError("CRC loop bytes changed since discovery")
+            raise ValueError("crc loop bytes changed since discovery")
     roles = candidate["registers"]
     count_reg, source_reg, table_reg, crc_reg = (
         getattr(ux, "UC_X86_REG_" + roles[role].upper()) for role in ("count", "source", "table", "crc"))
