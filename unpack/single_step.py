@@ -3,15 +3,8 @@ import struct
 from unicorn import UcError
 import unicorn.x86_const as ux
 
-
 REGISTERS = ('rax', 'rcx', 'rdx', 'rbx', 'rsp', 'rbp', 'rsi', 'rdi',
              'r8', 'r9', 'r10', 'r11', 'r12', 'r13', 'r14', 'r15', 'rip')
-AREA = 0x33000000000
-SIZE = 0x10000
-CONTEXT = AREA + 0x1000
-RECORD = AREA + 0x2000
-DISPATCHER = AREA + 0x2100
-RETURN = AREA + 0x3000
 
 
 class SingleStep:
@@ -24,9 +17,15 @@ class SingleStep:
         self.directory = (directory.VirtualAddress, directory.Size)
         self.active = False
         self.mapped = False
+        self.area = tracer.arch.step_area
+        self.area_size = tracer.arch.step_size
+        self.area_context = self.area + 0x1000
+        self.area_record = self.area + 0x2000
+        self.area_dispatcher = self.area + 0x2100
+        self.area_return = self.area + 0x3000
 
     def interrupt(self, uc, number, _):
-        rip = uc.reg_read(ux.UC_X86_REG_RIP)
+        rip = uc.reg_read(self.tracer.arch.ip)
         flags = uc.reg_read(ux.UC_X86_REG_EFLAGS)
         if number != 1 or not flags & 0x100 or self.active:
             self.tracer.stop('unhandled_interrupt', rip, interrupt=number)
@@ -45,23 +44,21 @@ class SingleStep:
         matches = [(i, row) for i, row in enumerate(struct.iter_unpack('<III', table))
                    if row[0] <= rip - self.base < row[1]]
         if len(matches) != 1:
-            raise ValueError('single step address must match exactly one runtime function')
+            raise ValueError('single step function missing or ambiguous')
         index, (begin, end, unwind) = matches[0]
         version_flags, prologue, count, frame = uc.mem_read(self.base + unwind, 4)
         if version_flags & 7 != 1 or version_flags >> 3 not in (1, 3):
-            raise ValueError('single step requires an unchained exception handler')
+            raise ValueError('unsupported single step handler')
         frame_register = frame & 15
         if frame_register not in (3, 5, 6, 7, 12, 13, 14, 15) or rip - self.base < begin + prologue:
-            raise ValueError('single step requires an established nonvolatile frame register')
-        frame_names = ('rax', 'rcx', 'rdx', 'rbx', 'rsp', 'rbp', 'rsi', 'rdi',
-                       'r8', 'r9', 'r10', 'r11', 'r12', 'r13', 'r14', 'r15')
-        establisher = uc.reg_read(getattr(ux, 'UC_X86_REG_' + frame_names[frame_register].upper())) - (frame >> 4) * 16
+            raise ValueError('unsupported single step frame')
+        establisher = uc.reg_read(getattr(ux, 'UC_X86_REG_' + REGISTERS[frame_register].upper())) - (frame >> 4) * 16
         tail = self.base + unwind + 4 + ((count + 1) & ~1) * 2
         handler = self.base + struct.unpack('<I', uc.mem_read(tail, 4))[0]
         if not self.tracer.in_module(handler):
             raise ValueError('exception handler outside image')
         if not self.mapped:
-            uc.mem_map(AREA, SIZE)
+            uc.mem_map(self.area, self.area_size)
             self.mapped = True
         blob = bytearray(0x4d0)
         struct.pack_into('<I', blob, 0x30, 0x10001f)
@@ -71,14 +68,14 @@ class SingleStep:
             struct.pack_into('<Q', blob, 0x78 + i * 8, uc.reg_read(getattr(ux, 'UC_X86_REG_' + name.upper())))
         for i in range(16):
             blob[0x1a0 + i*16:0x1b0 + i*16] = uc.reg_read(getattr(ux, f'UC_X86_REG_XMM{i}')).to_bytes(16, 'little')
-        uc.mem_write(CONTEXT, bytes(blob))
+        uc.mem_write(self.area_context, bytes(blob))
         record = bytearray(0x98)
         struct.pack_into('<I', record, 0, 0x80000004)
         struct.pack_into('<Q', record, 0x10, rip)
-        uc.mem_write(RECORD, bytes(record))
+        uc.mem_write(self.area_record, bytes(record))
         dispatch = struct.pack('<QQQQQQQQQII', rip, self.base, self.base + rva + index * 12,
-                               establisher, 0, CONTEXT, handler, tail + 4, 0, 0, 0)
-        uc.mem_write(DISPATCHER, dispatch)
+                               establisher, 0, self.area_context, handler, tail + 4, 0, 0, 0)
+        uc.mem_write(self.area_dispatcher, dispatch)
         self.saved = uc.context_save()
         self.original = bytes(blob)
         self.original_rip = rip
@@ -86,10 +83,10 @@ class SingleStep:
         self.function_range = (self.base + begin, self.base + end)
         self.handler_data = tail + 4
         self.active = True
-        stack = AREA + SIZE - 0x108
-        uc.mem_write(stack, struct.pack('<Q', RETURN))
-        for register, value in ((ux.UC_X86_REG_RCX, RECORD), (ux.UC_X86_REG_RDX, establisher),
-                                (ux.UC_X86_REG_R8, CONTEXT), (ux.UC_X86_REG_R9, DISPATCHER),
+        stack = self.area + self.area_size - 0x108
+        uc.mem_write(stack, struct.pack('<Q', self.area_return))
+        for register, value in ((ux.UC_X86_REG_RCX, self.area_record), (ux.UC_X86_REG_RDX, establisher),
+                                (ux.UC_X86_REG_R8, self.area_context), (ux.UC_X86_REG_R9, self.area_dispatcher),
                                 (ux.UC_X86_REG_RSP, stack), (ux.UC_X86_REG_EFLAGS, flags & ~0x100),
                                 (ux.UC_X86_REG_RIP, handler)):
             uc.reg_write(register, value)
@@ -98,14 +95,14 @@ class SingleStep:
     def on_block(self, address):
         if not self.active:
             return False
-        if address != RETURN:
+        if address != self.area_return:
             return self.tracer.in_module(address)
         disposition = self.uc.reg_read(ux.UC_X86_REG_RAX) & 0xffffffff
         self.active = False
         if disposition != 0:
             self.tracer.stop('single_step_unsupported', self.original_rip, disposition=disposition)
             return True
-        blob = bytes(self.uc.mem_read(CONTEXT, len(self.original)))
+        blob = bytes(self.uc.mem_read(self.area_context, len(self.original)))
         self.uc.context_restore(self.saved)
         changes = {}
         for i, name in enumerate(REGISTERS):

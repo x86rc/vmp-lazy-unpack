@@ -3,9 +3,10 @@ import struct
 from collections import defaultdict, deque
 from dataclasses import dataclass
 
-from capstone import CS_GRP_CALL, CS_GRP_JUMP, CS_GRP_RET
+from capstone import CS_GRP_CALL, CS_GRP_JUMP, CS_GRP_RET, CS_MODE_32
 from capstone.x86 import X86_OP_REG, X86_OP_IMM, X86_OP_MEM
 
+from .arch import arch_of
 from .semantic_crc import instruction_ranges
 from .semantic_lzma import LzmaMatcher
 
@@ -13,6 +14,7 @@ from .semantic_lzma import LzmaMatcher
 BASE_PROBABILITIES = 0x736
 LITERAL_PROBABILITIES = 0x300
 NONVOLATILE = {'rbx', 'rbp', 'rsi', 'rdi', 'r12', 'r13', 'r14', 'r15'}
+NONVOLATILE32 = {'rbx', 'rbp', 'rsi', 'rdi'}
 
 
 @dataclass(frozen=True)
@@ -23,18 +25,23 @@ class Decoder:
     sites: tuple
 
 
+def frame_nonvolatile(matcher):
+    return NONVOLATILE32 if matcher.decoder.mode == CS_MODE_32 else NONVOLATILE
+
+
 def frame_start(matcher, address):
     first = matcher.decode(address)
     if first is None:
         return False
     ops = first.operands
+    nonvolatile = frame_nonvolatile(matcher)
     if first.mnemonic == 'push':
-        if len(ops) != 1 or ops[0].type != X86_OP_REG or matcher.root(ops[0].reg) not in NONVOLATILE:
+        if len(ops) != 1 or ops[0].type != X86_OP_REG or matcher.root(ops[0].reg) not in nonvolatile:
             return False
     elif first.mnemonic == 'mov':
         if (len(ops) != 2 or ops[0].type != X86_OP_MEM or ops[1].type != X86_OP_REG or
                 matcher.root(ops[0].mem.base) != 'rsp' or ops[0].mem.index or
-                ops[0].mem.disp not in (8, 16, 24, 32)):
+                ops[0].mem.disp not in ((4, 8, 12, 16) if matcher.decoder.mode == CS_MODE_32 else (8, 16, 24, 32))):
             return False
     else:
         return False
@@ -53,7 +60,7 @@ def frame_start(matcher, address):
             continue
         if ins.mnemonic == 'push' and ops[0].type == X86_OP_REG:
             register = matcher.root(ops[0].reg)
-            if register in NONVOLATILE:
+            if register in nonvolatile:
                 saved.add(register)
         if saved and len(ops) == 2 and ops[0].type == X86_OP_REG and matcher.root(ops[0].reg) == 'rsp':
             if ins.mnemonic == 'sub' and ops[1].type == X86_OP_IMM and ops[1].imm > 0:
@@ -99,15 +106,15 @@ def collect_decoder(matcher, entry, sites):
         if ins.group(CS_GRP_CALL):
             if len(ops) != 1 or ops[0].type != X86_OP_IMM:
                 return None
-            pending.append((ops[0].imm, depth + 8))
-            maximum = max(maximum, depth + 8)
+            pending.append((ops[0].imm, depth + matcher.ptr))
+            maximum = max(maximum, depth + matcher.ptr)
             continue
         if any(matcher.root(reg) == 'rsp' for reg in ins.regs_access()[1]):
             if ins.mnemonic in ('push', 'pushfq'):
-                depth += 8
+                depth += matcher.ptr
             elif ins.mnemonic in ('pop', 'popfq') and not any(
                     op.type == X86_OP_REG and matcher.root(op.reg) == 'rsp' for op in ops):
-                depth -= 8
+                depth -= matcher.ptr
             elif (ins.mnemonic in ('add', 'sub') and len(ops) == 2 and
                   ops[0].type == X86_OP_REG and matcher.root(ops[0].reg) == 'rsp' and ops[1].type == X86_OP_IMM):
                 depth += ops[1].imm * (1 if ins.mnemonic == 'sub' else -1)
@@ -140,7 +147,7 @@ def discover_decoders(pe, sites):
     base = pe.OPTIONAL_HEADER.ImageBase
     sections = [(base + s.VirtualAddress, s.get_data()[:s.Misc_VirtualSize])
                 for s in pe.sections if s.Characteristics & 0x20000000]
-    matcher = LzmaMatcher(sections)
+    matcher = LzmaMatcher(sections, arch_of(pe).cs_mode)
     incoming = defaultdict(list)
     for address, data in sections:
         for match in re.finditer(rb'\xe9|\xe8|\x0f[\x80-\x8f]', data):

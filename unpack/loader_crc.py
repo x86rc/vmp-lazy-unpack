@@ -7,7 +7,7 @@ def discover_crc_loops(pe):
     return discover_semantic_crc_loops(pe)
 
 
-def accelerate_crc(uc, address, candidate, image_start, image_end, file_ranges=()):
+def accelerate_crc(uc, address, candidate, image_start, image_end, file_ranges=(), arch=None):
     raw = candidate["bytes"]
     if candidate.get("proof_address", address) != address:
         raise ValueError("crc candidate address mismatch")
@@ -27,7 +27,7 @@ def accelerate_crc(uc, address, candidate, image_start, image_end, file_ranges=(
                                        for start, end in ((image_start, image_end),) + tuple(file_ranges))
             and image_start <= table and table + 1024 <= image_end):
         return None
-    stack = uc.reg_read(ux.UC_X86_REG_RSP)
+    stack = uc.reg_read(arch.sp if arch is not None else ux.UC_X86_REG_RSP)
     depth = candidate["stack_depth"]
     if not any(start <= stack - depth and stack <= end + 1 and permissions & UC_PROT_WRITE
                for start, end, permissions in uc.mem_regions()):

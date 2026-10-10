@@ -28,8 +28,9 @@ def dump_pe(read_memory, image_base):
     machine, count = struct.unpack_from("<HH", nt, 4)
     optional_size = read_u16(nt, 20)
     table_end = nt_offset + 24 + optional_size + count * 40
-    if machine != 0x8664 or optional_size != 240 or not 0 < count <= 96 or table_end > MAX_HEADERS:
-        raise ValueError("invalid windows x64 headers")
+    expected = {0x8664: (240, 0x20B), 0x14C: (224, 0x10B)}.get(machine)
+    if expected is None or optional_size != expected[0] or not 0 < count <= 96 or table_end > MAX_HEADERS:
+        raise ValueError("invalid windows headers")
     header_data = bytearray(read(0, table_end))
 
 
@@ -37,8 +38,8 @@ def dump_pe(read_memory, image_base):
         write_u32(header_data, nt_offset + 24 + optional_size + index * 40 + 20, 0)
     pe = pefile.PE(data=header_data, fast_load=True)
     header = pe.OPTIONAL_HEADER
-    if header.Magic != 0x20B or len(header.DATA_DIRECTORY) != 16:
-        raise ValueError("expected windows x64 headers with 16 data directories")
+    if header.Magic != expected[1] or len(header.DATA_DIRECTORY) != 16:
+        raise ValueError("expected 16 data directories")
     if header.ImageBase != image_base:
         raise ValueError("rebased image not supported")
     if not table_end <= header.SizeOfHeaders <= min(MAX_HEADERS, header.SizeOfImage):
@@ -60,7 +61,7 @@ def dump_pe(read_memory, image_base):
         size = max(section.Misc_VirtualSize, section.SizeOfRawData)
         start = section.VirtualAddress
         if start % section_alignment or start < previous_end or start + size > header.SizeOfImage:
-            raise ValueError("section unaligned or overlapping or outside image")
+            raise ValueError("invalid section data")
         previous_end = start + align_up(size, section_alignment)
         if previous_end > header.SizeOfImage:
             raise ValueError("aligned section exceeds image size")
@@ -98,6 +99,6 @@ def dump_pe(read_memory, image_base):
     for index in (4, 6, 11, 12):
         struct.pack_into("<II", output, header.DATA_DIRECTORY[index].get_file_offset(), 0, 0)
     struct.pack_into("<II", output, pe.FILE_HEADER.get_field_absolute_offset("PointerToSymbolTable"), 0, 0)
-    checked = parse_pe(bytes(output))
-    set_field("CheckSum", checked.generate_checksum())
+    set_field("CheckSum", 0)
+    parse_pe(bytes(output))
     return bytes(output)

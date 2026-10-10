@@ -18,7 +18,7 @@ def import_address_metadata(pe, report):
     if number(report['image_base']) != base:
         raise ValueError('import report and output image bases differ')
     addresses = {}
-    for category in ('bootstrap_iat', 'resolved_imports', 'recovered_iat', 'encoded_imports'):
+    for category in ('bootstrap_iat', 'resolved_imports', 'recovered_iat', 'encoded_imports', 'wrapper_imports'):
         for record in report.get(category, []):
             symbol = record['symbol']
             if isinstance(symbol, str) and symbol.startswith('ordinal_'):
@@ -37,7 +37,7 @@ def import_address_metadata(pe, report):
             if not targets:
                 raise ValueError(f'missing runtime import address for {module} {symbol}')
             if len(targets) != 1:
-                raise ValueError(f'conflicting runtime import addresses for {module} {symbol}')
+                raise ValueError(f'clashing runtime import addresses for {module} {symbol}')
             entries.append(dict(symbol=symbol, iat_rva=hex(item.address - base),
                                 iat_va=hex(item.address), runtime_address=hex(next(iter(targets)))))
     return dict(image_base=hex(base), imports=imports)

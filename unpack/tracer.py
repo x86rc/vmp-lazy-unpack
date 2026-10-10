@@ -5,18 +5,19 @@ import time
 from collections import Counter, deque
 from contextlib import nullcontext
 from datetime import datetime, timezone
+from importlib import import_module
 from pathlib import Path
 
 import pefile
+from .arch import MODE32, MODE64, arch_of, encode_ptr, for_pe, read_ptr
 from .binary import (
     encode_u16, encode_u32, encode_u64,
-    read_u64,
     write_u16, write_u32, write_u64,
 )
-from .catalog import Catalog, find_or_capture_catalog
+from .catalog import Catalog, ensure_catalog_arch, find_or_capture_catalog
 from .api_handlers import (
     ApiHandlers, PAGE_SIZE, HOST_IMAGE_BASE, EMU_HEAP_BASE, EMU_HEAP_SIZE,
-    TEB_BASE, PEB_BASE, normalize_module_name, split_import_label,
+    TEB_BASE, PEB_BASE, split_import_label,
 )
 from .dump import dump_pe
 from .reconstruct import reconstruct_imports
@@ -24,7 +25,8 @@ from .loader_crc import discover_crc_loops, accelerate_crc
 from .semantic_lzma import discover_lzma_candidates
 from .lzma_adapter import DecoderAccelerator
 from .file_model import FileModel
-from .encoded_imports import recover_encoded_imports
+from .decode_imports_xor import XorImportDecoder
+from .decode_imports_arx import ArxImportDecoder
 from .discover import recover_keys
 from .progress import watch_run, log_line
 from .diagnostics import Diagnostics
@@ -33,8 +35,9 @@ from .import_calls import ImportCallLog
 from .imports import import_address_metadata
 from .single_step import SingleStep
 from .records import ModuleImage, ImportWrite, Event, format_report
-from .pe import (write_pe_structure, memory_image, IMAGE_FILE_HEADER, IMAGE_EXPORT_DIRECTORY,
+from .pe import (write_pe_structure, memory_image, load_pe, IMAGE_FILE_HEADER, IMAGE_EXPORT_DIRECTORY,
                  IMAGE_DATA_DIRECTORY, IMAGE_OPTIONAL_HEADER64, IMAGE_SECTION_HEADER)
+
 
 ACTIVE_CATALOG = None
 
@@ -46,7 +49,6 @@ def require_catalog():
 
 from unicorn import (
     UC_ARCH_X86,
-    UC_MODE_64,
     UC_PROT_ALL,
     Uc,
     UcError,
@@ -54,15 +56,15 @@ from unicorn import (
 import unicorn.x86_const as ux
 
 
-STACK_BASE = 0x60000000
-STACK_SIZE = 0x200000
-RETURN_SENTINEL = 0x00007FF900001000
-EMU_MODULE_BASE = 0x00007FFA00000000
-EMU_MODULE_STRIDE = 0x200000
-EMU_MODULE_SIZE = 0x80000
-EMU_FILE_VIEW_BASE = 0x0000030000000000
-PEB_LDR_BASE = 0x7FF720000000
-PEB_LDR_SIZE = 0x10000
+STACK_BASE = MODE64.stack_base
+STACK_SIZE = MODE64.stack_size
+RETURN_SENTINEL = MODE64.return_sentinel
+EMU_MODULE_BASE = MODE64.emu_module_base
+EMU_MODULE_STRIDE = MODE64.emu_module_stride
+EMU_MODULE_SIZE = MODE64.emu_module_size
+EMU_FILE_VIEW_BASE = MODE64.emu_file_view_base
+PEB_LDR_BASE = MODE64.peb_ldr_base
+PEB_LDR_SIZE = MODE64.peb_ldr_size
 KUSER_SHARED_DATA_BASE = 0x7FFE0000
 
 EXTRA_EMU_EXPORTS = {
@@ -103,33 +105,12 @@ SYSTEM_EXPORT_MODULES = (
     "user32.dll",
 )
 
-GPR_REGS = (
-    ("rax", ux.UC_X86_REG_RAX),
-    ("rbx", ux.UC_X86_REG_RBX),
-    ("rcx", ux.UC_X86_REG_RCX),
-    ("rdx", ux.UC_X86_REG_RDX),
-    ("rsi", ux.UC_X86_REG_RSI),
-    ("rdi", ux.UC_X86_REG_RDI),
-    ("rbp", ux.UC_X86_REG_RBP),
-    ("rsp", ux.UC_X86_REG_RSP),
-    ("r8", ux.UC_X86_REG_R8),
-    ("r9", ux.UC_X86_REG_R9),
-    ("r10", ux.UC_X86_REG_R10),
-    ("r11", ux.UC_X86_REG_R11),
-    ("r12", ux.UC_X86_REG_R12),
-    ("r13", ux.UC_X86_REG_R13),
-    ("r14", ux.UC_X86_REG_R14),
-    ("r15", ux.UC_X86_REG_R15),
-    ("rip", ux.UC_X86_REG_RIP),
-)
-
-
 def align_up(value, alignment=PAGE_SIZE):
     return (value + alignment - 1) & ~(alignment - 1)
 
 
-def register_state(uc):
-    state = {name: uc.reg_read(reg) for name, reg in GPR_REGS}
+def register_state(uc, arch=MODE64):
+    state = {name: uc.reg_read(reg) for name, reg in arch.gpr}
     state["rflags"] = uc.reg_read(ux.UC_X86_REG_EFLAGS)
     return state
 
@@ -162,7 +143,7 @@ def load_system_syscall_catalog():
     return require_catalog().syscall_catalog()
 
 
-def build_emu_module_blob(module_name, symbols, module_base):
+def build_emu_module_blob(module_name, symbols, module_base, arch=MODE64):
     named = sorted(
         symbol for symbol in symbols if not symbol.lower().startswith("ordinal_")
     )
@@ -193,14 +174,17 @@ def build_emu_module_blob(module_name, symbols, module_base):
     write_u32(blob, 0x3C, 0x80)
     write_u32(blob, 0x80, 0x00004550)
     write_pe_structure(blob, 0x84, IMAGE_FILE_HEADER,
-                       Machine=0x8664, SizeOfOptionalHeader=0xF0, Characteristics=0x2022)
+                       Machine=arch.machine, SizeOfOptionalHeader=arch.optional_size, Characteristics=0x2022)
     optional = 0x98
-    write_u16(blob, optional, 0x20B)
-    write_u64(blob, optional + 0x18, module_base)
+    write_u16(blob, optional, arch.magic)
+    if arch.bits == 64:
+        write_u64(blob, optional + 0x18, module_base)
+    else:
+        write_u32(blob, optional + 0x1C, module_base)
     write_u32(blob, optional + 0x38, EMU_MODULE_SIZE)
     write_u32(blob, optional + 0x3C, 0x400)
-    write_u32(blob, optional + 0x6C, 16)
-    write_pe_structure(blob, optional + 0x70, IMAGE_DATA_DIRECTORY,
+    write_u32(blob, optional + (0x6C if arch.bits == 64 else 0x5C), 16)
+    write_pe_structure(blob, optional + (0x70 if arch.bits == 64 else 0x60), IMAGE_DATA_DIRECTORY,
                        VirtualAddress=export_rva, Size=0x8000)
 
     cursor = strings_rva
@@ -222,20 +206,27 @@ def build_emu_module_blob(module_name, symbols, module_base):
         write_u16(blob, ordinals_rva + name_index * 2, assignments[symbol])
 
     if module_name == "ntdll.dll":
+        syscalls = {}
+        for record in records:
+            if "syscall" in record:
+                syscalls.setdefault(record["name"], record["syscall"])
         for symbol, function_index in assignments.items():
             if not symbol.lower().startswith(("nt", "zw")):
                 continue
             stub = stubs_rva + function_index * 0x10
-            matches = [record["syscall"] for record in require_catalog().exports("ntdll.dll")
-                       if record["name"] == symbol and "syscall" in record]
-            if not matches:
+            if symbol not in syscalls:
                 continue
-            syscall_number = matches[0]
-            blob[stub:stub + 11] = (
-                b"\x4C\x8B\xD1\xB8" + encode_u32(syscall_number) +
-                b"\x0F\x05\xC3"
-            )
-
+            syscall_number = syscalls[symbol]
+            if arch.bits == 64:
+                blob[stub:stub + 11] = (
+                    b"\x4C\x8B\xD1\xB8" + encode_u32(syscall_number) +
+                    b"\x0F\x05\xC3"
+                )
+            else:
+                blob[stub:stub + 6] = b"\xB8" + encode_u32(syscall_number) + b"\xC3"
+    if arch.bits == 32 and module_name == 'ntdll.dll':
+        patch_ntdll_stubs = import_module('.32bit.tracer_32', __package__).patch_ntdll_stubs
+        patch_ntdll_stubs(blob, assignments, stubs_rva, require_catalog())
     write_pe_structure(blob, export_rva, IMAGE_EXPORT_DIRECTORY,
                        Name=module_name_rva,
                        Base=1,
@@ -247,7 +238,7 @@ def build_emu_module_blob(module_name, symbols, module_base):
     return bytes(blob), assignments, stubs_rva
 
 
-def map_emu_windows_modules(uc, import_slots):
+def map_emu_windows_modules(uc, import_slots, arch=MODE64):
     catalog = {}
     for label in import_slots.values():
         module_name, symbol = split_import_label(label)
@@ -270,11 +261,11 @@ def map_emu_windows_modules(uc, import_slots):
     symbol_targets = {}
     export_lookup = {}
     for module_index, module_name in enumerate(sorted(catalog)):
-        module_base = EMU_MODULE_BASE + module_index * EMU_MODULE_STRIDE
+        module_base = arch.emu_module_base + module_index * arch.emu_module_stride
         blob, assignments, stubs_rva = build_emu_module_blob(
-            module_name, catalog[module_name], module_base
+            module_name, catalog[module_name], module_base, arch
         )
-        uc.mem_map(module_base, EMU_MODULE_SIZE, UC_PROT_ALL)
+        uc.mem_map(module_base, arch.emu_module_size, UC_PROT_ALL)
         uc.mem_write(module_base, blob)
         module_bases[module_name] = module_base
         for symbol, function_index in assignments.items():
@@ -292,7 +283,7 @@ def map_emu_windows_modules(uc, import_slots):
     for slot, label in import_slots.items():
         module_name, symbol = split_import_label(label)
         target = symbol_targets[(module_name, symbol.lower())]
-        uc.mem_write(slot, encode_u64(target))
+        uc.mem_write(slot, encode_ptr(arch, target))
     return module_bases, target_labels, export_lookup
 
 
@@ -313,6 +304,13 @@ def map_pe(uc, pe):
             continue
         uc.mem_write(destination, data[:maximum])
     return image_base, image_base + image_size
+
+
+def file_view_base_for(arch, mapped_start, mapped_end, view_size):
+    base = arch.emu_file_view_base
+    if mapped_start < base + view_size and base < mapped_end:
+        return align_up(mapped_end, 0x10000)
+    return base
 
 
 def pe_memory_image(pe):
@@ -346,6 +344,7 @@ def summarize_mapped_sections(uc, pe):
 
 def build_resolved_import_report(
         uc, tracer, module_bases, import_slots, image_base):
+    arch = getattr(tracer, 'arch', MODE64)
     target_to_label = dict(tracer.synthetic_import_targets)
     restored_imports = []
     for slot, record in sorted(tracer.resolved_import_writes.items()):
@@ -382,8 +381,8 @@ def build_resolved_import_report(
     restored_slots = set(tracer.resolved_import_writes)
     for start, end, section_name in tracer.image_section_ranges:
         data = bytes(uc.mem_read(start, end - start))
-        for offset in range(0, len(data) - 7, 8):
-            target = read_u64(data, offset)
+        for offset in range(0, len(data) - arch.ptr + 1, arch.ptr):
+            target = read_ptr(arch, data, offset)
             label = target_to_label.get(target)
             if label is None:
                 continue
@@ -409,6 +408,11 @@ def build_resolved_import_report(
         record for record in final_image_matches
         if record["source"] == "final_scan_only"
     ]
+    if arch.bits == 32:
+        classify_scanned_imports = import_module('.32bit.bootstrap_imports_32', __package__).classify_scanned_imports
+        recovered_iat, additional_imports = classify_scanned_imports(
+            bootstrap_imports, recovered_iat, tracer.packed_destination_ranges)
+        restored_imports.extend(additional_imports)
     import_key = lambda record: (
         record["module"], record["emu_address"]
     )
@@ -427,8 +431,12 @@ def build_resolved_import_report(
         module["last_slot_rva"] = record["slot_rva"]
     encoded = {"tables": [], "imports": []}
     if getattr(tracer, "encoded_string_keys", ()):
-        encoded = recover_encoded_imports(bytes(uc.mem_read(image_base, tracer.image_end - image_base)),
-                                         image_base, module_bases, require_catalog(), tracer.encoded_string_keys)
+        xor_imports = XorImportDecoder(image_base, module_bases, require_catalog(), tracer.encoded_string_keys,
+                                      slot_size=arch.ptr)
+        encoded = xor_imports.recover(bytes(uc.mem_read(image_base, tracer.image_end - image_base)))
+    arx_imports = getattr(tracer, 'arx_imports', None)
+    if not encoded['imports'] and arx_imports is not None and arx_imports.observations:
+        encoded = arx_imports.recover(bytes(uc.mem_read(image_base, tracer.image_end - image_base)))
     return {
         "image_base": image_base,
         "encoded_import_tables": encoded["tables"],
@@ -437,7 +445,7 @@ def build_resolved_import_report(
         "emu_modules": {
             name: {
                 "base": base,
-                "size": EMU_MODULE_SIZE,
+                "size": arch.emu_module_size,
             }
             for name, base in sorted(module_bases.items())
         },
@@ -523,7 +531,12 @@ def map_peb_loader_data(uc, module_bases, process_image):
     return entries
 
 
-def map_synthetic_process_state(uc, module_bases, process_image=None):
+def map_synthetic_process_state(uc, module_bases, process_image=None, arch=MODE64):
+    if arch.bits == 32:
+        map_process32 = import_module('.32bit.tracer_32', __package__).map_synthetic_process_state
+        return map_process32(
+            uc, module_bases, process_image, require_catalog().windows,
+            KUSER_SHARED_DATA_BASE, PAGE_SIZE, wow64=uc._mode == MODE64.uc_mode)
     version = require_catalog().windows
     windows_build = version["build"]
     uc.mem_map(STACK_BASE, STACK_SIZE, UC_PROT_ALL)
@@ -570,8 +583,16 @@ def map_synthetic_process_state(uc, module_bases, process_image=None):
 
 
 class Tracer(ApiHandlers):
+    def __new__(cls, *args, **kwargs):
+        pe = args[4] if len(args) > 4 else kwargs.get('pe')
+        if cls is Tracer and (kwargs.get('arch') or arch_of(pe)).bits == 32:
+            Tracer32 = import_module('.32bit.tracer_32', __package__).Tracer32
+            return object.__new__(Tracer32)
+        return object.__new__(cls)
+
     def __init__(self, uc, image_start, image_end, synthetic_import_targets,
-                 pe, module_bases, export_lookup, progress=None, diagnostics=None):
+                 pe, module_bases, export_lookup, progress=None, diagnostics=None, arch=None):
+        self.arch = arch or arch_of(pe)
         self.uc = uc
         self.progress = progress
         self.diagnostics = diagnostics
@@ -590,8 +611,10 @@ class Tracer(ApiHandlers):
         }
         self.image_start = image_start
         self.image_end = image_end
-        self.single_step = SingleStep(self, pe)
+        self.single_step = self.make_single_step(pe)
         self.synthetic_import_targets = synthetic_import_targets
+        self.arx_imports = (ArxImportDecoder(image_start, image_end, self.arch, synthetic_import_targets)
+                            if self.arch.bits == 64 else None)
         self.events = []
         self.stop_reason = None
         self.stop_registers = None
@@ -603,10 +626,10 @@ class Tracer(ApiHandlers):
         self.process_affinity_mask = 1
         self.thread_affinity_mask = 1
         self.export_lookup = export_lookup
-        self.heap_cursor = EMU_HEAP_BASE + 0x1000
+        self.heap_cursor = self.arch.emu_heap_base + 0x1000
         self.heap_allocations = {}
         self.local_allocations = set()
-        self.files = FileModel(uc, {"sample.exe": bytes(pe.__data__)})
+        self.files = FileModel(uc, {"sample.exe": bytes(pe.__data__)}, next_view=self.arch.file_view_base)
         self.blocks = 0
         self.block_counter = None
         self.hook_statistics = {}
@@ -633,14 +656,14 @@ class Tracer(ApiHandlers):
                 self.stack_copy_candidates.add(image_start + section.VirtualAddress + cursor)
                 cursor += 1
 
-        discovery = {
-            "crc_candidates": [{"address": address, "kind": candidate.get('kind', 'crc')}
-                               for address, candidate in self.discovered_crc_loops.items()],
-            "stack_copy_candidates": sorted(self.stack_copy_candidates),
-            "lzma_sites": self.lzma_sites,
-            "lzma_decoders": sorted(self.decompressors.candidates),
-        }
         if diagnostics:
+            discovery = {
+                "crc_candidates": [{"address": address, "kind": candidate.get('kind', 'crc')}
+                                   for address, candidate in self.discovered_crc_loops.items()],
+                "stack_copy_candidates": sorted(self.stack_copy_candidates),
+                "lzma_sites": self.lzma_sites,
+                "lzma_decoders": sorted(self.decompressors.candidates),
+            }
             diagnostics.record('accelerator_discovery', **discovery)
             for address, candidate in self.discovered_crc_loops.items():
                 ranges = candidate.get('code_ranges', [(address, candidate['bytes'])])
@@ -674,6 +697,9 @@ class Tracer(ApiHandlers):
     def catalog(self):
         return require_catalog()
 
+    def make_single_step(self, pe):
+        return SingleStep(self, pe)
+
     def in_module(self, address):
         return self.image_start <= address < self.image_end
 
@@ -691,7 +717,7 @@ class Tracer(ApiHandlers):
 
     def stop_event(self, event):
         self.stop_reason = event
-        self.stop_registers = register_state(self.uc)
+        self.stop_registers = register_state(self.uc, self.arch)
         self.uc.emu_stop()
         if self.diagnostics:
             self.diagnostics.checkpoint(self.uc, blocks=self.blocks, stop_reason=event,
@@ -713,12 +739,6 @@ class Tracer(ApiHandlers):
             result.append(value)
         return result.decode("ascii", errors="replace")
 
-
-    def packed_destination_for(self, address):
-        for start, end, name in self.packed_destination_ranges:
-            if start <= address < end:
-                return start, end, name
-        return None
 
     def section_for_address(self, address):
         for start, end, name in self.image_section_ranges:
@@ -743,7 +763,7 @@ class Tracer(ApiHandlers):
         size = max(1, int(size))
         address = align_up(self.heap_cursor, 0x10)
         end = address + align_up(size, 0x10)
-        if end > EMU_HEAP_BASE + EMU_HEAP_SIZE:
+        if end > self.arch.emu_heap_base + self.arch.emu_heap_size:
             raise MemoryError(f"synthetic heap exhausted allocating 0x{size:X} bytes")
         self.heap_cursor = end
         self.heap_allocations[address] = size
@@ -758,6 +778,10 @@ class Tracer(ApiHandlers):
         if address:
             self.uc.mem_write(address, encode_u64(value & 0xFFFFFFFFFFFFFFFF))
 
+    def write_ptr_if_mapped(self, address, value):
+        if address:
+            self.uc.mem_write(address, encode_ptr(self.arch, value & self.arch.mask))
+
     def on_block(self, uc, address, size, user_data):
         if self.block_counter is None:
             self.blocks += 1
@@ -770,7 +794,7 @@ class Tracer(ApiHandlers):
             self.single_step.unwind()
             if self.import_log is not None:
                 self.import_log.finish('stopped' if self.stop_reason else 'unwind',
-                                       target=hex(uc.reg_read(ux.UC_X86_REG_RIP)))
+                                       target=hex(uc.reg_read(self.arch.ip)))
             return
         if self.single_step.on_block(address):
             return
@@ -816,7 +840,7 @@ class Tracer(ApiHandlers):
         if address in self.discovered_crc_loops:
             try:
                 details = accelerate_crc(uc, address, self.discovered_crc_loops[address], self.image_start, self.image_end,
-                                         [(start, start + view["size"]) for start, view in self.files.views.items()])
+                                         [(start, start + view["size"]) for start, view in self.files.views.items()], self.arch)
                 if details:
                     self.crc_accelerations.append(details)
                     self.add_event("discovered_crc_accelerated", address, **details)
@@ -862,11 +886,11 @@ class Tracer(ApiHandlers):
                 result=result,
                 **details,
             )
-            rsp = uc.reg_read(ux.UC_X86_REG_RSP)
-            return_address = read_u64(uc.mem_read(rsp, 8))
-            uc.reg_write(ux.UC_X86_REG_RAX, result)
-            uc.reg_write(ux.UC_X86_REG_RSP, rsp + 8)
-            uc.reg_write(ux.UC_X86_REG_RIP, return_address)
+            rsp = uc.reg_read(self.arch.sp)
+            return_address = read_ptr(self.arch, uc.mem_read(rsp, self.arch.ptr))
+            uc.reg_write(self.arch.ax, result)
+            uc.reg_write(self.arch.sp, rsp + self.arch.ptr + self.import_stack_bytes(label))
+            uc.reg_write(self.arch.ip, return_address)
             return
 
         if not self.in_module(address):
@@ -881,14 +905,14 @@ class Tracer(ApiHandlers):
             self.ordinary_blocks.add(address)
 
     def on_cpuid_instruction(self, uc, user_data):
-        leaf = uc.reg_read(ux.UC_X86_REG_EAX)
-        subleaf = uc.reg_read(ux.UC_X86_REG_ECX)
-        registers = (ux.UC_X86_REG_RAX, ux.UC_X86_REG_RBX,
-                     ux.UC_X86_REG_RCX, ux.UC_X86_REG_RDX)
+        leaf = uc.reg_read(self.arch.ax)
+        subleaf = uc.reg_read(self.arch.cx)
+        registers = (self.arch.ax, ux.UC_X86_REG_EBX,
+                     self.arch.cx, self.arch.dx)
         values = None
         if leaf == 1:
             if self.cpuid_engine is None:
-                self.cpuid_engine = Uc(UC_ARCH_X86, UC_MODE_64)
+                self.cpuid_engine = Uc(UC_ARCH_X86, self.arch.uc_mode)
                 self.cpuid_engine.ctl_set_cpu_model(uc.ctl_get_cpu_model())
                 self.cpuid_engine.mem_map(0x1000, PAGE_SIZE)
                 self.cpuid_engine.mem_write(0x1000, b'\x0f\xa2')
@@ -907,12 +931,19 @@ class Tracer(ApiHandlers):
             for register, value in zip(registers, values):
                 uc.reg_write(register, value)
             details['output'] = dict(zip(('eax', 'ebx', 'ecx', 'edx'), map(hex, values)))
-        self.add_event('cpuid', uc.reg_read(ux.UC_X86_REG_RIP), **details)
+        self.add_event('cpuid', uc.reg_read(self.arch.ip), **details)
         return int(values is not None)
 
     def on_syscall_instruction(self, uc, user_data):
-        address = uc.reg_read(ux.UC_X86_REG_RIP)
-        syscall_number = uc.reg_read(ux.UC_X86_REG_RAX)
+        self.handle_trap(uc, ux.UC_X86_REG_R10)
+
+    def on_interrupt(self, uc, number, _):
+        self.single_step.interrupt(uc, number, _)
+
+    def handle_trap(self, uc, argument_register, address=None):
+        if address is None:
+            address = uc.reg_read(self.arch.ip)
+        syscall_number = uc.reg_read(self.arch.ax)
         syscall_names = self.syscall_catalog.get(syscall_number, [])
         if self.diagnostics:
             self.diagnostics.record('syscall_enter', syscall_number=syscall_number,
@@ -924,7 +955,7 @@ class Tracer(ApiHandlers):
         if syscall_names:
             try:
                 result, details = self.emulate_import(
-                    'ntdll.dll!' + syscall_names[0], argument_register=ux.UC_X86_REG_R10)
+                    'ntdll.dll!' + syscall_names[0], argument_register=argument_register)
             except Exception as exc:
                 details = {'error': str(exc)}
         self.add_event(
@@ -939,15 +970,16 @@ class Tracer(ApiHandlers):
         if result is None:
             self.stop_event(self.events[-1])
             return
-        uc.reg_write(ux.UC_X86_REG_RAX, result)
-        uc.reg_write(ux.UC_X86_REG_RCX, address + 2)
-        uc.reg_write(ux.UC_X86_REG_R11, rflags)
+        uc.reg_write(self.arch.ax, result)
+        if self.arch.bits == 64:
+            uc.reg_write(ux.UC_X86_REG_RCX, address + 2)
+            uc.reg_write(ux.UC_X86_REG_R11, rflags)
         if self.diagnostics:
             self.diagnostics.record('syscall_return', syscall_number=syscall_number,
                                     blocks=self.blocks, **self.diagnostics.snapshot(uc))
 
     def on_peb_read(self, uc, access, address, size, value, user_data):
-        rip = uc.reg_read(ux.UC_X86_REG_RIP)
+        rip = uc.reg_read(self.arch.ip)
         try:
             raw_value = bytes(uc.mem_read(address, size))
         except Exception:
@@ -956,7 +988,7 @@ class Tracer(ApiHandlers):
             "peb_memory_read",
             rip,
             memory_address=address,
-            peb_offset=address - PEB_BASE,
+            peb_offset=address - self.arch.peb_base,
             size=size,
             value=raw_value,
         )
@@ -968,15 +1000,15 @@ class Tracer(ApiHandlers):
             left, right = max(start, address), min(end, address + size)
             if left < right:
                 self.written_destination_pages.update(range(left // PAGE_SIZE, (right - 1) // PAGE_SIZE + 1))
-        if size != 8:
+        if size != self.arch.ptr:
             return
-        target = value & 0xFFFFFFFFFFFFFFFF
+        target = value & self.arch.mask
         label = self.synthetic_import_targets.get(target)
         if label is None:
             return
         previous = self.resolved_import_writes.get(address)
         self.resolved_import_writes[address] = ImportWrite(
-            target, uc.reg_read(ux.UC_X86_REG_RIP), self.blocks,
+            target, uc.reg_read(self.arch.ip), self.blocks,
             previous.write_count + 1 if previous else 1)
         self.resolved_write_count += 1
 
@@ -1014,12 +1046,13 @@ class Tracer(ApiHandlers):
 
         if bytes(self.uc.mem_read(address, 2)) != b"\xf3\xa4":
             return False
-        count = self.uc.reg_read(ux.UC_X86_REG_RCX)
-        source = self.uc.reg_read(ux.UC_X86_REG_RSI)
-        destination = self.uc.reg_read(ux.UC_X86_REG_RDI)
-        if self.uc.reg_read(ux.UC_X86_REG_RFLAGS) & 0x400 or not 1 <= count <= STACK_SIZE:
+        count = self.uc.reg_read(self.arch.cx)
+        source = self.uc.reg_read(self.arch.si)
+        destination = self.uc.reg_read(self.arch.di)
+        if self.uc.reg_read(ux.UC_X86_REG_EFLAGS) & 0x400 or not 1 <= count <= self.arch.stack_size:
             return False
-        if not all(STACK_BASE <= start and start + count <= STACK_BASE + STACK_SIZE for start in (source, destination)):
+        if not all(self.arch.stack_base <= start and start + count <= self.arch.stack_base + self.arch.stack_size
+                   for start in (source, destination)):
             return False
         if source < destination < source + count:
 
@@ -1030,17 +1063,17 @@ class Tracer(ApiHandlers):
         else:
             data = bytes(self.uc.mem_read(source, count))
         self.uc.mem_write(destination, data)
-        self.uc.reg_write(ux.UC_X86_REG_RSI, source + count)
-        self.uc.reg_write(ux.UC_X86_REG_RDI, destination + count)
-        self.uc.reg_write(ux.UC_X86_REG_RCX, 0)
-        self.uc.reg_write(ux.UC_X86_REG_RIP, address + 2)
+        self.uc.reg_write(self.arch.si, source + count)
+        self.uc.reg_write(self.arch.di, destination + count)
+        self.uc.reg_write(self.arch.cx, 0)
+        self.uc.reg_write(self.arch.ip, address + 2)
         self.stack_copy_count += 1
         self.stack_copy_bytes += count
         return True
 
 
     def on_invalid_memory(self, uc, access, address, size, value, user_data):
-        rip = uc.reg_read(ux.UC_X86_REG_RIP)
+        rip = uc.reg_read(self.arch.ip)
         self.stop(
             "invalid_memory",
             rip,
@@ -1076,15 +1109,17 @@ def build_argument_parser():
     parser = LogArgumentParser(prog="python -m unpack", add_help=False, allow_abbrev=False)
     parser.add_argument("pe", type=Path)
     parser.add_argument("output_name", nargs="?")
+    parser.add_argument("--32bit", dest="arch32", action="store_true")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--diagnostics", action="store_true")
-    mode.add_argument("--imports_only", action="store_true")
+    mode.add_argument("--imports_only", "--only_imports", action="store_true")
     return parser
 
 
 def main():
     started = time.monotonic()
     args = build_argument_parser().parse_args()
+    arch = MODE32 if args.arch32 else MODE64
     try:
         input_path = args.pe.resolve(strict=True)
         output_name = args.output_name
@@ -1093,21 +1128,21 @@ def main():
         final_path = final_output_path(input_path, output_name)
         if args.imports_only:
             from .static_imports import run_static_imports
-            run_static_imports(input_path, final_path)
+            run_static_imports(input_path, final_path, arch)
             return
     except (ValueError, OSError) as exc:
         raise SystemExit(log_line(exc)) from exc
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     output_dir = Path.cwd() / "scratch" / f"trace_{timestamp}"
     output_dir.mkdir(parents=True, exist_ok=False)
-    diagnostic_context = Diagnostics(output_dir) if args.diagnostics else nullcontext(None)
+    diagnostic_context = Diagnostics(output_dir, arch=arch) if args.diagnostics else nullcontext(None)
     with watch_run(output_dir) as progress, diagnostic_context as diagnostics:
-        run(input_path, final_path, output_dir, progress, diagnostics)
+        run(input_path, final_path, output_dir, progress, diagnostics, arch)
     print(f"{round(time.monotonic() - started)} seconds elapsed")
 
 
 def print_resolution_counts(reconstruction):
-    counts = Counter(('wrapper' if patch['category'] == 'encoded_wrapper' else 'static', patch['mnemonic'])
+    counts = Counter(('wrapper' if patch['category'] in ('encoded_wrapper', 'api_wrapper') else 'static', patch['mnemonic'])
                      for patch in reconstruction['patches'])
     print(f"static calls {counts['static', 'call']} jumps {counts['static', 'jmp']} "
           f"loads {counts['static', 'mov']} pushes {counts['static', 'push']}")
@@ -1117,23 +1152,26 @@ def print_resolution_counts(reconstruction):
     print(f"{len(reconstruction['patches'])} resolutions")
 
 
-def run(input_path, final_path, output_dir, progress, diagnostics=None):
+def run(input_path, final_path, output_dir, progress, diagnostics=None, arch=MODE64):
     global ACTIVE_CATALOG
     progress("loading windows catalog")
     try:
-        catalog_path = find_or_capture_catalog((Path.cwd(), Path(__file__).resolve().parent.parent))
-        ACTIVE_CATALOG = Catalog(catalog_path)
+        catalog_path = find_or_capture_catalog((Path.cwd(), Path(__file__).resolve().parent.parent), arch)
+        ACTIVE_CATALOG = Catalog(catalog_path, arch)
+        ensure_catalog_arch(ACTIVE_CATALOG, arch)
     except (ValueError, OSError) as exc:
         raise SystemExit(log_line(exc)) from exc
 
     progress("reading binary")
     input_bytes = input_path.read_bytes()
-    pe = pefile.PE(data=input_bytes, fast_load=False)
-    if pe.FILE_HEADER.Machine != pefile.MACHINE_TYPE["IMAGE_FILE_MACHINE_AMD64"]:
-        raise SystemExit("expected windows x64 binary")
-    if pe.OPTIONAL_HEADER.Magic != 0x20B:
-        raise SystemExit("expected windows x64 headers")
-    pe.parse_data_directories(directories=[pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_IMPORT"]])
+    pe = load_pe(input_bytes)
+    try:
+        actual = for_pe(pe)
+    except ValueError:
+        raise SystemExit("unsupported binary format")
+    if actual.bits != arch.bits:
+        raise SystemExit("binary is windows 64 bit remove --32bit" if actual.bits == 64 else
+                         "binary is windows 32 bit use --32bit")
     is_dll = bool(pe.FILE_HEADER.Characteristics & 0x2000)
     if diagnostics:
         diagnostics.record('input', path=str(input_path))
@@ -1148,37 +1186,45 @@ def run(input_path, final_path, output_dir, progress, diagnostics=None):
     import_slots = collect_imports(pe)
 
     progress("mapping image and windows environment")
-    uc = Uc(UC_ARCH_X86, UC_MODE_64)
+    if arch.bits == 32:
+        create_engine = import_module('.32bit.tracer_32', __package__).create_engine
+        uc = create_engine(require_catalog())
+    else:
+        uc = Uc(UC_ARCH_X86, arch.uc_mode)
     mapped_start, mapped_end = map_pe(uc, pe)
-    clean_ntdll = pefile.PE(data=require_catalog().ntdll_bytes, fast_load=False)
+    clean_ntdll = load_pe(require_catalog().ntdll_bytes)
     emu_file_bytes = pe_memory_image(clean_ntdll)
-    uc.mem_map(EMU_FILE_VIEW_BASE, align_up(len(emu_file_bytes)), UC_PROT_ALL)
-    uc.mem_write(EMU_FILE_VIEW_BASE, emu_file_bytes)
-    module_bases, synthetic_import_targets, export_lookup = map_emu_windows_modules(uc, import_slots)
+    emu_file_view_base = file_view_base_for(arch, mapped_start, mapped_end, align_up(len(emu_file_bytes)))
+    uc.mem_map(emu_file_view_base, align_up(len(emu_file_bytes)), UC_PROT_ALL)
+    uc.mem_write(emu_file_view_base, emu_file_bytes)
+    module_bases, synthetic_import_targets, export_lookup = map_emu_windows_modules(uc, import_slots, arch)
     process_image = None if is_dll else ModuleImage(input_path.name, mapped_start,
                                                    pe.OPTIONAL_HEADER.SizeOfImage, entry, str(input_path))
-    rsp = map_synthetic_process_state(uc, module_bases, process_image)
-    for _, reg in GPR_REGS:
+    rsp = map_synthetic_process_state(uc, module_bases, process_image, arch)
+    for _, reg in arch.gpr:
         uc.reg_write(reg, 0)
-    uc.reg_write(ux.UC_X86_REG_RSP, rsp)
-    uc.reg_write(ux.UC_X86_REG_RFLAGS, 0x202)
-    uc.reg_write(ux.UC_X86_REG_RCX, mapped_start if is_dll else 0)
-    uc.reg_write(ux.UC_X86_REG_RDX, 1 if is_dll else 0)
-    uc.reg_write(ux.UC_X86_REG_RIP, entry)
+    uc.reg_write(arch.sp, rsp)
+    uc.reg_write(ux.UC_X86_REG_EFLAGS, 0x202)
+    if arch.bits == 64:
+        uc.reg_write(ux.UC_X86_REG_RCX, mapped_start if is_dll else 0)
+        uc.reg_write(ux.UC_X86_REG_RDX, 1 if is_dll else 0)
+    elif is_dll:
+        uc.mem_write(rsp, encode_ptr(arch, arch.return_sentinel) + encode_u32(mapped_start) +
+                     encode_u32(1) + encode_u32(0))
+    uc.reg_write(arch.ip, entry)
 
     tracer = Tracer(uc, mapped_start, mapped_end, synthetic_import_targets,
-                    pe, module_bases, export_lookup, progress=progress, diagnostics=diagnostics)
+                    pe, module_bases, export_lookup, progress=progress, diagnostics=diagnostics, arch=arch)
     if diagnostics:
-        diagnostics.watch_mapping(uc, EMU_FILE_VIEW_BASE, len(emu_file_bytes), 'initial ntdll.dll image')
-        if 'ntdll.dll' in module_bases:
-            diagnostics.watch_mapping(uc, module_bases['ntdll.dll'], EMU_MODULE_SIZE, 'loaded ntdll.dll')
+        diagnostics.watch_mapping(uc, emu_file_view_base, len(emu_file_bytes), 'initial ntdll.dll image')
+        diagnostics.watch_mapping(uc, module_bases['ntdll.dll'], arch.emu_module_size, 'loaded ntdll.dll')
         diagnostics.watch_mapping(uc, KUSER_SHARED_DATA_BASE, PAGE_SIZE, 'KUSER_SHARED_DATA')
     tracer.module_paths = {base: f"C:\\Windows\\System32\\{name}" for name, base in module_bases.items()}
     tracer.module_paths[mapped_start] = str(input_path)
     tracer.module_paths[0] = process_image.path if process_image else "C:\\host.exe"
     if is_dll:
-        tracer.module_paths[HOST_IMAGE_BASE] = "C:\\host.exe"
-    tracer.files.files[input_path.name.lower()] = bytes(pe.__data__)
+        tracer.module_paths[arch.host_image_base] = "C:\\host.exe"
+    tracer.files.files[input_path.name.lower()] = input_bytes
     progress("recovering encoded string keys")
     tracer.encoded_string_keys = tuple(recover_keys(bytes(pe.__data__)))
     tracer.files.files["ntdll.dll"] = require_catalog().ntdll_bytes
@@ -1187,9 +1233,9 @@ def run(input_path, final_path, output_dir, progress, diagnostics=None):
     progress("emulating unpacker")
     if diagnostics:
         diagnostics.checkpoint(uc, blocks=0, entry=entry)
-    import_log_context = ImportCallLog(output_dir / 'import_calls.json') if diagnostics else nullcontext(None)
+    import_log_context = ImportCallLog(output_dir / 'import_calls.json', arch) if diagnostics else nullcontext(None)
     with import_log_context as import_log, \
-            TraceHooks(tracer, PEB_BASE, PAGE_SIZE) as hooks:
+            TraceHooks(tracer, arch.peb_base, PAGE_SIZE) as hooks:
         tracer.import_log = import_log
         progress(f"hook backend {hooks.backend}")
         if hooks.backend == 'python':
@@ -1217,7 +1263,7 @@ def run(input_path, final_path, output_dir, progress, diagnostics=None):
             "error": error,
             "blocks": tracer.blocks,
             "hooks": tracer.hook_statistics,
-            "registers": register_state(uc),
+            "registers": register_state(uc, arch),
             "written_destination_pages": sorted(tracer.written_destination_pages),
         }
         reason = tracer.stop_reason.kind if tracer.stop_reason else "no_stop"
@@ -1240,9 +1286,16 @@ def run(input_path, final_path, output_dir, progress, diagnostics=None):
     progress("rebuilding binary")
     try:
         ranges = tracer.restored_ranges()
-        output, reconstruction = reconstruct_imports(dump_pe(uc.mem_read, mapped_start), import_report, ranges)
-        with pefile.PE(data=output) as rebuilt:
-            import_metadata = import_address_metadata(rebuilt, import_report)
+        dumped = dump_pe(uc.mem_read, mapped_start)
+        if arch.bits == 32:
+            preserve_import_lookups = import_module('.32bit.bootstrap_imports_32', __package__).preserve_import_lookups
+            dumped = preserve_import_lookups(dumped, pe)
+        output, reconstruction = reconstruct_imports(
+            dumped, import_report, ranges,
+            api_targets=tracer.synthetic_import_targets)
+        with load_pe(output) as rebuilt:
+            import_metadata = import_address_metadata(
+                rebuilt, dict(import_report, wrapper_imports=reconstruction.get('wrapper_imports', [])))
         analysis_pe_path = final_path
         analysis_pe_path.parent.mkdir(parents=True, exist_ok=True)
         with analysis_pe_path.open("wb") as stream:
@@ -1283,7 +1336,7 @@ def run(input_path, final_path, output_dir, progress, diagnostics=None):
         "stop_reason": tracer.stop_reason,
         "unicorn_error": error,
         "stop_registers": tracer.stop_registers,
-        "final_registers": register_state(uc),
+        "final_registers": register_state(uc, arch),
         "mapped_sections": section_summaries,
         "analysis_pe": str(analysis_pe_path) if analysis_pe_path else None,
         "reconstruction_report": str(reconstruction_report_path) if reconstruction_report_path else None,

@@ -1,13 +1,18 @@
-import struct
+from importlib import import_module
 import pefile
 from capstone import CS_ARCH_X86, CS_MODE_64, Cs
 from capstone.x86 import X86_OP_MEM, X86_OP_REG, X86_REG_RIP
-from .binary import encode_i32, encode_u64, read_i32, read_u64, write_u32, write_u64
+from .arch import encode_ptr, for_pe, read_ptr, write_ptr
+from .binary import encode_i32, encode_u32, read_i32, read_u32, write_u32
 from .pe import align_up, parse_pe, file_offset
 from .pe import write_pe_structure, IMAGE_IMPORT_DESCRIPTOR
 from .imports import number, import_slots
-from .import_wrappers import resolve_import_wrappers
+from .import_wrappers import resolve_import_wrappers, retarget_wrapper_patch
+from .decode_imports_arx import validate_metadata as validate_arx_metadata
+from .decode_imports_xor import validate_metadata as validate_xor_metadata
 from .unwind import repair_exception_tables
+
+reconstruct_32 = import_module('.32bit.reconstruct_32', __package__)
 
 IMPORT_STORAGE_CHARACTERISTICS = 0xC0000040
 
@@ -75,7 +80,7 @@ def extra_imports(pe, records, section_rva):
     groups = {}
     for record in records:
         module, symbol = identity(record)
-        groups.setdefault(module, []).append((symbol, record))
+        groups.setdefault(module, []).append(symbol)
     existing = list(getattr(pe, "DIRECTORY_ENTRY_IMPORT", []))
     names = {}
     for descriptor in existing:
@@ -83,6 +88,7 @@ def extra_imports(pe, records, section_rva):
     descriptor_size = (len(groups) + 1) * 20
     content = bytearray(descriptor_size)
     slots = {}
+    arch = for_pe(pe)
 
     def pad(alignment):
         content.extend(bytes(align_up(len(content), alignment) - len(content)))
@@ -92,32 +98,33 @@ def extra_imports(pe, records, section_rva):
         name = names.get(module, module[:-4].upper() + '.dll' if module.endswith('.dll') else module.upper())
         content.extend(name.encode("ascii") + b"\0")
         thunks = []
-        for symbol, _ in imports:
+        for symbol in imports:
             if isinstance(symbol, int):
-                thunks.append((1 << 63) | symbol)
+                thunks.append(arch.ordinal_flag | symbol)
             else:
                 if not symbol or "\0" in symbol:
                     raise BuildError("invalid import name")
                 pad(2)
                 thunks.append(section_rva + len(content))
                 content.extend(b"\0\0" + symbol.encode("ascii") + b"\0")
-        pad(8)
+        pad(arch.ptr)
         lookup_rva = section_rva + len(content)
-        encoded = b"".join(encode_u64(value) for value in thunks) + bytes(8)
+        encoded = b"".join(encode_ptr(arch, value) for value in thunks) + bytes(arch.ptr)
         content.extend(encoded)
         iat_rva = section_rva + len(content)
         content.extend(encoded)
-        for slot_index, (symbol, _) in enumerate(imports):
-            slots[(module, symbol)] = pe.OPTIONAL_HEADER.ImageBase + iat_rva + slot_index * 8
+        for slot_index, symbol in enumerate(imports):
+            slots[(module, symbol)] = pe.OPTIONAL_HEADER.ImageBase + iat_rva + slot_index * arch.ptr
         write_pe_structure(content, index * 20, IMAGE_IMPORT_DESCRIPTOR,
                            OriginalFirstThunk=lookup_rva, Name=name_rva, FirstThunk=iat_rva)
     return bytes(content), descriptor_size, slots
 
 
-def reconstruct_imports(data, report, restored_ranges, *, scan_wrappers=True):
+def reconstruct_imports(data, report, restored_ranges, *, scan_wrappers=True, api_targets=None):
 
     data, storage = prepare_import_storage(data)
     pe = parse_pe(data)
+    arch = for_pe(pe)
     base = pe.OPTIONAL_HEADER.ImageBase
     if number(report["image_base"]) != base:
         raise BuildError("import report image base mismatch")
@@ -127,19 +134,19 @@ def reconstruct_imports(data, report, restored_ranges, *, scan_wrappers=True):
         raise BuildError("no restored import ranges")
     image = pe.get_memory_mapped_image(max_virtual_address=pe.OPTIONAL_HEADER.SizeOfImage)
     actual = import_slots(pe)
-    bootstrap = {}
+    bootstrap = set()
     bootstrap_targets = {}
     for record in report["bootstrap_iat"]:
         slot = number(record["slot_rva"])
         key = identity(record)
         if actual.get(slot) != key:
             raise BuildError("bootstrap import differs from binary metadata")
-        bootstrap.setdefault(key, base + slot)
+        bootstrap.add(key)
         if "emu_address" in record:
             bootstrap_targets.setdefault(key, set()).add(number(record["emu_address"]))
 
     def restored(slot):
-        return any(start <= slot and slot + 8 <= end for start, end in restored_ranges)
+        return any(start <= slot and slot + arch.ptr <= end for start, end in restored_ranges)
 
     selected = {}
     for category, records in (("recovered_iat", report["recovered_iat"]),
@@ -150,11 +157,11 @@ def reconstruct_imports(data, report, restored_ranges, *, scan_wrappers=True):
                 continue
             if category == "recovered_iat" and number(record["emu_address"]) not in bootstrap_targets.get(identity(record), set()):
                 raise BuildError("bootstrap import mismatch")
-            offset = file_offset(pe, slot, 8)
-            if read_u64(data, offset) != number(record["emu_address"]):
+            offset = file_offset(pe, slot, arch.ptr)
+            if read_ptr(arch, data, offset) != number(record["emu_address"]):
                 raise BuildError("import pointer mismatch")
             if slot in selected and identity(selected[slot][0]) != identity(record):
-                raise BuildError("conflicting imports at slot")
+                raise BuildError("clashing imports at slot")
             selected[slot] = (record, category)
     encoded = {}
     for record in report.get("encoded_imports", []):
@@ -162,27 +169,32 @@ def reconstruct_imports(data, report, restored_ranges, *, scan_wrappers=True):
         key = record["key"]
         if record.get("encoding") != "subtract_signed_i32" or not isinstance(key, int) or not -(1 << 31) <= key < (1 << 31):
             raise BuildError("unsupported encoded import arithmetic")
-        offset = file_offset(pe, slot, 8)
-        stored = read_u64(data, offset)
-        if stored != number(record["encoded_value"]) or (stored + key) & 0xffffffffffffffff != number(record["emu_address"]):
+        offset = file_offset(pe, slot, arch.ptr)
+        stored = read_ptr(arch, data, offset)
+        if stored != number(record["encoded_value"]) or (stored + key) & arch.mask != number(record["emu_address"]):
             raise BuildError("encoded import mismatch")
-        metadata = file_offset(pe, number(record["record_rva"]), 12)
-        _, actual_slot, actual_key = struct.unpack_from("<IIi", data, metadata)
-        if (actual_slot, actual_key) != (slot, key):
-            raise BuildError("encoded import metadata differs from dump")
+        validate_metadata = (validate_arx_metadata if record.get('metadata_encoding') == 'arx32'
+                             else validate_xor_metadata)
+        if not validate_metadata(data, pe, record):
+            raise BuildError('encoded import metadata differs from dump')
         if key == 0 and slot in selected and identity(selected[slot][0]) == identity(record):
             continue
         if slot in encoded and encoded[slot] != record:
-            raise BuildError("conflicting encoded import records")
+            raise BuildError("clashing encoded import records")
         encoded[slot] = record
         selected.pop(slot, None)
-    if not selected and not encoded:
+    discovered = []
+    discovery_report = None
+    if scan_wrappers and arch.bits == 64 and not report.get('encoded_imports') and api_targets:
+        discovered, discovery_report = resolve_import_wrappers(
+            pe, image, [], None, restored_ranges, api_targets=api_targets)
+    if not selected and not encoded and not discovered:
         raise BuildError("no imports recovered")
-    extras = {}
-    for record in [item[0] for item in selected.values()] + list(encoded.values()):
+    extras = set()
+    for record in [item[0] for item in selected.values()] + list(encoded.values()) + discovered:
         key = identity(record)
         if key not in bootstrap:
-            extras.setdefault(key, record)
+            extras.add(key)
     for slot, key in actual.items():
         if slot in encoded:
             raise BuildError("encoded slot overlaps existing import")
@@ -191,9 +203,9 @@ def reconstruct_imports(data, report, restored_ranges, *, scan_wrappers=True):
                 raise BuildError("observed slot conflicts with existing import")
         else:
             selected[slot] = (dict(module=key[0], symbol=key[1], slot_rva=slot,
-                                   emu_address=read_u64(data, file_offset(pe, slot, 8))), 'bootstrap')
+                                   emu_address=read_ptr(arch, data, file_offset(pe, slot, arch.ptr))), 'bootstrap')
     records = {}
-    for record in [item[0] for item in selected.values()] + list(encoded.values()):
+    for record in [item[0] for item in selected.values()] + list(encoded.values()) + discovered:
         records.setdefault(identity(record), record)
     section_rva = storage["payload_rva"]
     content, descriptor_size, new_slots = extra_imports(pe, list(records.values()), section_rva)
@@ -202,20 +214,20 @@ def reconstruct_imports(data, report, restored_ranges, *, scan_wrappers=True):
 
 
     plain = {slot: record for slot, (record, _) in selected.items()}
-    for slot, (record, _) in selected.items():
-        if slot in actual and actual[slot] != identity(record):
-            raise BuildError("observed slot conflicts with existing import")
     thunks = {}
     for record in list(encoded.values()) + list(plain.values()):
         key = identity(record)
         if key in thunks:
             continue
-        content.extend(bytes(align_up(len(content), 8) - len(content)))
+        content.extend(bytes(align_up(len(content), arch.ptr) - len(content)))
         address = base + section_rva + len(content)
-        displacement = destinations[key] - (address + 6)
-        if not -(1 << 31) <= displacement < (1 << 31):
-            raise BuildError("import thunk exceeds relative address range")
-        content.extend(b"\xff\x25" + encode_i32(displacement))
+        if arch.bits == 64:
+            displacement = destinations[key] - (address + 6)
+            if not -(1 << 31) <= displacement < (1 << 31):
+                raise BuildError("import thunk exceeds relative address range")
+            content.extend(b"\xff\x25" + encode_i32(displacement))
+        else:
+            content.extend(b"\xff\x25" + encode_u32(destinations[key]))
         thunks[key] = address
     targets = {}
     for slot, (record, category) in selected.items():
@@ -225,8 +237,19 @@ def reconstruct_imports(data, report, restored_ranges, *, scan_wrappers=True):
         if category == "runtime":
             category = "runtime_duplicate" if identity(record) in bootstrap else "runtime_only"
         targets[base + slot] = (destination, category, record)
-    patches = scan_import_references(pe, image, targets) if targets else []
-    if scan_wrappers:
+    if arch.bits == 32:
+        patches = reconstruct_32.scan_import_references(pe, image, targets) if targets else []
+    else:
+        patches = scan_import_references(pe, image, targets) if targets else []
+    if discovery_report is not None:
+        wrapper_report = discovery_report
+        for patch in discovered:
+            relocated = retarget_wrapper_patch(patch, destinations, arch)
+            if relocated is None:
+                raise BuildError('wrapper iat target exceeds relative address range')
+            patches.append(relocated)
+        patches.sort(key=lambda p: p['instruction_va'])
+    elif scan_wrappers:
         wrapper_patches, wrapper_report = resolve_import_wrappers(
             pe, image, list(encoded.values()), destinations, restored_ranges)
         patches = sorted(patches + wrapper_patches, key=lambda p: p["instruction_va"])
@@ -248,14 +271,14 @@ def reconstruct_imports(data, report, restored_ranges, *, scan_wrappers=True):
     slot_records = [(slot, record, record["key"], encoded_patches) for slot, record in encoded.items()]
     slot_records += [(slot, record, 0, plain_patches) for slot, record in plain.items()]
     for slot, record, key, patch_list in slot_records:
-        offset = file_offset(pe, slot, 8)
-        covered = set(range(offset, offset + 8))
+        offset = file_offset(pe, slot, arch.ptr)
+        covered = set(range(offset, offset + arch.ptr))
         if covered & (occupied | instruction_patches):
             raise BuildError("overlapping import slot patches")
         occupied.update(covered)
         thunk = thunks[identity(record)]
-        value = (thunk - key) & 0xffffffffffffffff
-        write_u64(output, offset, value)
+        value = (thunk - key) & arch.mask
+        write_ptr(arch, output, offset, value)
         patch_list.append({"slot_rva": hex(slot), "file_offset": offset,
                                 "old_value": record.get("encoded_value", record["emu_address"]), "new_value": hex(value),
                                 "key": key, "thunk_va": hex(thunk),
@@ -273,15 +296,13 @@ def reconstruct_imports(data, report, restored_ranges, *, scan_wrappers=True):
         unexpected = [(hex(slot), key) for slot, key in verified_slots.items() if expected.get(slot) != key]
         raise BuildError(f"rebuilt import mismatch with {len(missing)} missing or changed {missing[:8]} and "
                          f"{len(unexpected)} unexpected {unexpected[:8]}")
-    write_u32(output, verified.OPTIONAL_HEADER.get_field_absolute_offset("CheckSum"), verified.generate_checksum())
+    write_u32(output, verified.OPTIONAL_HEADER.get_field_absolute_offset("CheckSum"), 0)
     output = bytes(output)
     try:
         output, exception_report = repair_exception_tables(output)
     except ValueError as exc:
         output = bytearray(output)
         set_directory(output, verified, 3, 0, 0)
-        checked = parse_pe(bytes(output))
-        write_u32(output, checked.OPTIONAL_HEADER.get_field_absolute_offset("CheckSum"), checked.generate_checksum())
         output = bytes(output)
         exception_report = {"status": "cleared", "error": str(exc)}
     for patch in patches:
@@ -289,14 +310,17 @@ def reconstruct_imports(data, report, restored_ranges, *, scan_wrappers=True):
         if output[offset:offset + len(patch["new_bytes"])] != patch["new_bytes"]:
             raise BuildError("patch verification failed")
     for patch in encoded_patches + plain_patches:
-        value = read_u64(output, patch["file_offset"])
+        value = read_ptr(arch, output, patch["file_offset"])
         thunk = number(patch["thunk_va"])
         offset = file_offset(verified, thunk - base, 6)
-        if (value + patch["key"]) & 0xffffffffffffffff != thunk or output[offset:offset + 2] != b"\xff\x25":
+        if (value + patch["key"]) & arch.mask != thunk or output[offset:offset + 2] != b"\xff\x25":
             raise BuildError("import slot thunk verification failed")
-        if thunk + 6 + read_i32(output, offset + 2) != number(patch["iat_va"]):
+        if arch.bits == 64:
+            if thunk + 6 + read_i32(output, offset + 2) != number(patch["iat_va"]):
+                raise BuildError("import slot thunk iat target mismatch")
+        elif read_u32(output, offset + 2) != number(patch["iat_va"]):
             raise BuildError("import slot thunk iat target mismatch")
-    return output, serializable_report({
+    result = {
         "import_storage": section,
         "exceptions": exception_report,
         "import_count": len(expected),
@@ -306,7 +330,12 @@ def reconstruct_imports(data, report, restored_ranges, *, scan_wrappers=True):
         "plain_slot_patches": plain_patches,
         "import_thunk_count": len(thunks),
         "wrapper_resolution": wrapper_report,
-    })
+    }
+    if discovery_report is not None:
+        result['wrapper_imports'] = [dict(module=r['module'], symbol=r['symbol'],
+                                          emu_address=r['emu_address'])
+                                     for r in records.values() if r.get('category') == 'api_wrapper']
+    return output, serializable_report(result)
 
 class BuildError(RuntimeError):
     pass
@@ -337,27 +366,26 @@ def scan_import_references(
         boundary = None
         offset = 0
         while offset + 6 <= len(data):
-            prefix_size = 0
             if (
                 0x48 <= data[offset] <= 0x4F
                 and offset + 7 <= len(data)
                 and data[offset + 1] == 0x8B
                 and data[offset + 2] & 0xC7 == 0x05
             ):
-                prefix_size = 1
+                pass
             elif (
                 0x40 <= data[offset] <= 0x4F
                 and offset + 7 <= len(data)
                 and data[offset + 1] == 0xFF
                 and data[offset + 2] in (0x15, 0x25, 0x35)
             ):
-                prefix_size = 1
+                pass
             elif (
                 data[offset] == 0xFF
                 and data[offset + 1] in (0x15, 0x25, 0x35)
                 and not (offset and 0x40 <= data[offset - 1] <= 0x4F)
             ):
-                prefix_size = 0
+                pass
             else:
                 offset += 1
                 continue
@@ -433,7 +461,7 @@ def scan_import_references(
             previous = patches.get(patch_file_offset)
             if previous is not None and previous != patch:
                 raise BuildError(
-                    f"conflicting import patches at file offset 0x{patch_file_offset:X}"
+                    f"clashing import patches at file offset 0x{patch_file_offset:X}"
                 )
             patches[patch_file_offset] = patch
             offset += instruction.size

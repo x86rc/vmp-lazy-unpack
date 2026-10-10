@@ -1,5 +1,6 @@
-from capstone import Cs, CS_ARCH_X86, CS_MODE_64
+from capstone import Cs, CS_ARCH_X86, CS_MODE_32, CS_MODE_64
 from capstone.x86 import X86_OP_REG, X86_OP_IMM, X86_OP_MEM
+from .arch import arch_of
 from .binary import read_i32
 
 ROOTS = {}
@@ -12,6 +13,8 @@ for root, aliases in {
 for index in range(8, 16):
     ROOTS.update({f"r{index}{suffix}": f"r{index}" for suffix in ("", "d", "w", "b")})
 REG64 = set(ROOTS.values())
+TO32 = {"rax": "eax", "rbx": "ebx", "rcx": "ecx", "rdx": "edx",
+        "rsi": "esi", "rdi": "edi", "rbp": "ebp", "rsp": "esp"}
 SCRATCH_OPS = {"mov", "not", "neg", "inc", "dec", "add", "sub", "adc", "sbb", "xor", "and", "or", "shl", "sal", "shr", "sar", "rol", "ror", "rcl", "rcr"}
 PREFIX_OPS = SCRATCH_OPS | {"bswap", "btc", "btr", "bts"}
 
@@ -113,9 +116,10 @@ def scratch_operation(ins, md, stack, memory, flags):
         memory[start + index] = (result >> (8 * index)) & 255 if result is not None else None
 
 
-def recognize_loop(raw, address):
-    md = Cs(CS_ARCH_X86, CS_MODE_64)
-    md.detail = True
+def recognize_loop(raw, address, md=None):
+    if md is None:
+        md = Cs(CS_ARCH_X86, CS_MODE_64)
+        md.detail = True
     instructions = list(md.disasm(raw, address))
     if not instructions or sum(ins.size for ins in instructions) != len(raw):
         return None
@@ -153,12 +157,16 @@ def recognize_instructions(instructions, address, md):
     def root(op):
         return ROOTS.get(reg(op))
 
+    def base_name(register):
+        return ROOTS.get(md.reg_name(register)) if register else None
+
+    ptr = 4 if md.mode == CS_MODE_32 else 8
     skip = set()
     if len(instructions) >= 5:
         call, pop, add, jump, overwrite = instructions[:5]
         if (call.mnemonic == "call" and call.operands[0].type == X86_OP_IMM
                 and call.operands[0].imm == call.address + call.size
-                and pop.mnemonic == "pop" and reg(pop.operands[0]) in REG64
+                and pop.mnemonic == "pop" and root(pop.operands[0]) in REG64
                 and add.mnemonic == "add" and len(add.operands) == 2
                 and reg(add.operands[0]) == reg(pop.operands[0]) and add.operands[1].type == X86_OP_IMM
                 and jump.mnemonic == "jmp" and reg(jump.operands[0]) == reg(pop.operands[0])
@@ -169,7 +177,7 @@ def recognize_instructions(instructions, address, md):
 
 
             skip = {0, 1, 2, 3}
-            depth = 8
+            depth = ptr
     for index, ins in enumerate(instructions[:-1]):
         if index in skip:
             continue
@@ -184,26 +192,26 @@ def recognize_instructions(instructions, address, md):
             continue
         if (ins.mnemonic == "call" and len(ops) == 1 and ops[0].type == X86_OP_IMM
                 and ops[0].imm == instructions[index + 1].address):
-            stack -= 8
+            stack -= ptr
             depth = max(depth, -stack)
-            for byte in range(8):
+            for byte in range(ptr):
                 scratch[stack + byte] = ((ins.address + ins.size) >> (byte * 8)) & 255
             continue
         if ins.mnemonic == "push" and ops[0].type == X86_OP_IMM and ins.bytes[0] in (0x68, 0x6A):
-            stack -= 8
+            stack -= ptr
             depth = max(depth, -stack)
-            for byte in range(8):
+            for byte in range(ptr):
                 scratch[stack + byte] = (ops[0].imm >> (byte * 8)) & 255
             continue
-        if ins.mnemonic == "lea" and len(ops) == 2 and reg(ops[0]) == "rsp" and ops[1].type == X86_OP_MEM:
+        if ins.mnemonic == "lea" and len(ops) == 2 and root(ops[0]) == "rsp" and ops[1].type == X86_OP_MEM:
             mem = ops[1].mem
-            if md.reg_name(mem.base) != "rsp" or mem.index or not 0 <= mem.disp <= -stack:
+            if base_name(mem.base) != "rsp" or mem.index or not 0 <= mem.disp <= -stack:
                 return None
             stack += mem.disp
             continue
         if ops and ops[0].type == X86_OP_MEM and (ins.mnemonic in SCRATCH_OPS or ins.mnemonic.startswith("set")):
             mem = ops[0].mem
-            if mem.segment or md.reg_name(mem.base) != "rsp" or mem.index or any(op.type != X86_OP_IMM for op in ops[1:]):
+            if mem.segment or base_name(mem.base) != "rsp" or mem.index or any(op.type != X86_OP_IMM for op in ops[1:]):
                 return None
             if not stack <= stack + mem.disp < 0 or stack + mem.disp + ops[0].size > 0:
                 return None
@@ -248,7 +256,7 @@ def recognize_instructions(instructions, address, md):
     mem = load.operands[1].mem
     if mem.segment or mem.scale != 1:
         return None
-    address_regs = [md.reg_name(r) for r in (mem.base, mem.index) if r and md.reg_name(r) not in ("riz", "eiz")]
+    address_regs = [base_name(r) for r in (mem.base, mem.index) if r and md.reg_name(r) not in ("riz", "eiz")]
     if temp_root in address_regs:
         if len(prefix) != 1 or prefix[0].mnemonic != "mov" or len(prefix[0].operands) != 2 or reg(prefix[0].operands[0]) != temp or prefix[0].operands[1].type != X86_OP_IMM:
             return None
@@ -275,22 +283,25 @@ def recognize_instructions(instructions, address, md):
     if len(lookup.operands) != 2 or reg(lookup.operands[0]) != temp or lookup.operands[1].type != X86_OP_MEM or lookup.operands[1].size != 4:
         return None
     table_mem = lookup.operands[1].mem
-    table = md.reg_name(table_mem.base)
-    if table not in REG64 or table_mem.segment or table_mem.disp != 0 or table_mem.scale != 4 or md.reg_name(table_mem.index) != temp_root:
+    table = base_name(table_mem.base)
+    if table not in REG64 or table_mem.segment or table_mem.disp != 0 or table_mem.scale != 4 or base_name(table_mem.index) != temp_root:
         return None
-    if len(advance.operands) != 1 or reg(advance.operands[0]) != source or advance.operands[0].size != 8:
+    if len(advance.operands) != 1 or base_name(advance.operands[0].reg) != source or advance.operands[0].size != ptr:
         return None
-    if len(count_op.operands) != 1 or count_op.operands[0].size != 8 or reg(count_op.operands[0]) not in REG64:
+    if len(count_op.operands) != 1 or count_op.operands[0].size != ptr or base_name(count_op.operands[0].reg) not in REG64:
         return None
-    count = reg(count_op.operands[0])
-    if len({temp_root, ROOTS[crc], table, source, count, "rsp"}) != 6:
+    count_root = ROOTS[reg(count_op.operands[0])]
+    if len({temp_root, ROOTS[crc], table, source, count_root, "rsp"}) != 6:
         return None
     if len(key_op.operands) != 2 or reg(key_op.operands[0]) != crc or key_op.operands[1].type != X86_OP_IMM:
         return None
+    roles = {"source": source, "count": count_root, "table": table, "crc": crc}
+    if md.mode == CS_MODE_32:
+        roles = {role: TO32.get(name, name) for role, name in roles.items()}
     return {"bytes": b''.join(bytes(ins.bytes) for ins in instructions),
             "code_ranges": instruction_ranges(instructions),
             "state_xor": key_op.operands[1].imm & 0xffffffff,
-            "kind": "semantic_crc", "registers": {"source": source, "count": count, "table": table, "crc": crc},
+            "kind": "semantic_crc", "registers": roles,
             "stack_depth": depth, "proof_address": address, "branch_proofs": branch_proofs}
 
 
@@ -328,7 +339,7 @@ def recognize_scattered_loop(data, start, tail, base, md=None):
 
 def discover_semantic_crc_loops(pe):
     result = {}
-    md = Cs(CS_ARCH_X86, CS_MODE_64)
+    md = Cs(CS_ARCH_X86, arch_of(pe).cs_mode)
     md.detail = True
     for section in pe.sections:
         if not section.Characteristics & 0x20000000:
@@ -346,7 +357,7 @@ def discover_semantic_crc_loops(pe):
                         offset += 1
                         continue
                     address = pe.OPTIONAL_HEADER.ImageBase + section.VirtualAddress + start
-                    candidate = (recognize_loop(data[start:offset + size], address)
+                    candidate = (recognize_loop(data[start:offset + size], address, md)
                                  if 0 < offset - start <= 512 else None)
                     if candidate is None:
                         candidate = recognize_scattered_loop(data, start, offset, base, md)

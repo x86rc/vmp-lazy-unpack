@@ -2,12 +2,12 @@ from .pe import align_up, memory_image
 
 
 class FileModel:
-    def __init__(self, uc, files):
+    def __init__(self, uc, files, next_view=0x31000000000):
         self.uc = uc
         self.files = {name.lower(): data for name, data in files.items()}
         self.handles = {}
         self.next_handle = 0x2000
-        self.next_view = 0x31000000000
+        self.next_view = next_view
         self.views = {}
 
     def handle(self, record):

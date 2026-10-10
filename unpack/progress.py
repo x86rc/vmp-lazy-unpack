@@ -20,5 +20,4 @@ def watch_run(directory):
             yield stage
         except BaseException:
             stage(traceback.format_exc().splitlines()[-1])
-            log.flush()
             raise

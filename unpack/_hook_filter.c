@@ -4,6 +4,8 @@
 #include <stdlib.h>
 
 typedef int (*stop_callback)(void *);
+typedef int (*read_register_callback)(void *, int, void *);
+typedef int (*read_memory_callback)(void *, uint64_t, void *, size_t);
 typedef struct { uint64_t start, end; } Range;
 typedef struct {
     uint64_t start, end;
@@ -16,7 +18,13 @@ typedef struct {
     stop_callback stop;
     uint64_t blocks, block_calls, writes, write_calls;
     int all_blocks;
+    uint64_t *copies, stack_start, stack_end;
+    size_t copy_count;
+    read_register_callback read_register;
+    read_memory_callback read_memory;
+    int copy_bits, copy_registers[5];
 } Filter;
+
 static void callback_error(Filter *f, void *uc) {
     PyObject *type = NULL, *value = NULL, *traceback = NULL, *previous;
     PyErr_Fetch(&type, &value, &traceback);
@@ -49,6 +57,27 @@ static int contains(const uint64_t *values, size_t count, uint64_t value) {
     return 0;
 }
 
+static int forward_copy(Filter *f, void *uc, uint64_t address) {
+    unsigned char code[2];
+    uint64_t registers[5] = {0};
+    uint64_t count, source, destination;
+    int i;
+    if (f->read_memory(uc, address, code, sizeof(code)) || code[0] != 0xf3 || code[1] != 0xa4)
+        return 1;
+    for (i = 0; i < 5; ++i) {
+        if (f->copy_bits == 32 || i >= 3) {
+            uint32_t value = 0;
+            if (f->read_register(uc, f->copy_registers[i], &value)) return 1;
+            registers[i] = value;
+        } else if (f->read_register(uc, f->copy_registers[i], &registers[i])) return 1;
+    }
+    if ((registers[3] & 0x100) || (f->copy_bits == 32 && registers[4] == 0x33)) return 1;
+    count = registers[0]; source = registers[1]; destination = registers[2];
+    return !(registers[3] & 0x400) && count && count <= f->stack_end - f->stack_start &&
+           source >= f->stack_start && source <= f->stack_end - count &&
+           destination >= f->stack_start && destination <= f->stack_end - count;
+}
+
 static void filter_block(void *uc, uint64_t address, uint32_t size, void *user) {
     Filter *f = (Filter *)user;
     int forward = f->all_blocks || address < f->start || address >= f->end;
@@ -64,6 +93,8 @@ static void filter_block(void *uc, uint64_t address, uint32_t size, void *user) 
     if (!forward) forward = contains(f->points, f->point_count, address);
     for (i = 0; !forward && i < f->range_count; ++i)
         forward = f->ranges[i].start <= address && address < f->ranges[i].end;
+    if (!forward && contains(f->copies, f->copy_count, address))
+        forward = forward_copy(f, uc, address);
     if (forward) {
         PyGILState_STATE gil = PyGILState_Ensure();
         PyObject *result;
@@ -84,7 +115,8 @@ static void filter_write(void *uc, int access, uint64_t address, int size, int64
     ++f->writes;
     if (size <= 0) return;
     end = (uint64_t)size > UINT64_MAX - address ? UINT64_MAX : address + (uint64_t)size;
-    forward = size == 8 && contains(f->targets, f->target_count, (uint64_t)value);
+    forward = (size == 4 || size == 8) && contains(f->targets, f->target_count,
+                                                size == 4 ? (uint32_t)value : (uint64_t)value);
     for (i = 0; i < f->range_count; ++i) {
         uint64_t left = address > f->ranges[i].start ? address : f->ranges[i].start;
         uint64_t right = end < f->ranges[i].end ? end : f->ranges[i].end;
@@ -123,7 +155,7 @@ static void filter_write(void *uc, int access, uint64_t address, int size, int64
 
 static void free_filter(Filter *f) {
     if (!f) return;
-    free(f->ranges); free(f->points); free(f->targets); free(f->written); free(f);
+    free(f->ranges); free(f->points); free(f->targets); free(f->written); free(f->copies); free(f);
 }
 
 static void capsule_free(PyObject *capsule) {
@@ -162,7 +194,7 @@ static PyObject *create_filter(PyObject *self, PyObject *args) {
     if (!PyArg_ParseTuple(args, "KKOOOOOOKi", &start, &end, &ranges, &points, &targets,
                           &owner, &block, &write, &stop, &all_blocks)) return NULL;
     if (start >= end || (start & 4095) || !stop || !PyCallable_Check(block) || !PyCallable_Check(write)) {
-        PyErr_SetString(PyExc_ValueError, "invalid filter bounds or callbacks"); return NULL;
+        PyErr_SetString(PyExc_ValueError, "invalid filter bounds or callback"); return NULL;
     }
     f = calloc(1, sizeof(Filter));
     if (!f) return PyErr_NoMemory();
@@ -210,6 +242,31 @@ static PyObject *block_count(PyObject *self, PyObject *capsule) {
     return f ? PyLong_FromUnsignedLongLong(f->blocks) : NULL;
 }
 
+static PyObject *configure_copies(PyObject *self, PyObject *args) {
+    PyObject *capsule, *addresses;
+    unsigned long long read_register, read_memory, stack_start, stack_end;
+    int bits, registers[5];
+    uint64_t *copies = NULL;
+    size_t count;
+    Filter *f;
+    if (!PyArg_ParseTuple(args, "OOKKKKi(iiiii)", &capsule, &addresses, &read_register, &read_memory,
+                          &stack_start, &stack_end, &bits, &registers[0], &registers[1], &registers[2],
+                          &registers[3], &registers[4])) return NULL;
+    f = PyCapsule_GetPointer(capsule, "unpack.hook_filter");
+    if (!f) return NULL;
+    if (!read_register || !read_memory || stack_start >= stack_end || (bits != 32 && bits != 64)) {
+        PyErr_SetString(PyExc_ValueError, "invalid copy filter"); return NULL;
+    }
+    if (!read_addresses(addresses, &copies, &count)) { free(copies); return NULL; }
+    free(f->copies);
+    f->copies = copies; f->copy_count = count; f->copy_bits = bits;
+    f->stack_start = stack_start; f->stack_end = stack_end;
+    f->read_register = (read_register_callback)(uintptr_t)read_register;
+    f->read_memory = (read_memory_callback)(uintptr_t)read_memory;
+    for (int i = 0; i < 5; ++i) f->copy_registers[i] = registers[i];
+    Py_RETURN_NONE;
+}
+
 static PyObject *statistics(PyObject *self, PyObject *capsule) {
     Filter *f = PyCapsule_GetPointer(capsule, "unpack.hook_filter");
     if (!f) return NULL;
@@ -221,6 +278,7 @@ static PyObject *statistics(PyObject *self, PyObject *capsule) {
 
 static PyMethodDef methods[] = {
     {"create", create_filter, METH_VARARGS, NULL},
+    {"configure_copies", configure_copies, METH_VARARGS, NULL},
     {"block_count", block_count, METH_O, NULL},
     {"statistics", statistics, METH_O, NULL},
     {NULL, NULL, 0, NULL}

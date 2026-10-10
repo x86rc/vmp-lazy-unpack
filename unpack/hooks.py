@@ -26,12 +26,18 @@ class TraceHooks:
                 self.handles.append(self.uc.hook_add(UC_HOOK_BLOCK, tracer.on_block))
                 self.handles.append(self.uc.hook_add(UC_HOOK_MEM_WRITE, tracer.on_image_write,
                                                     begin=tracer.image_start, end=tracer.image_end - 1))
+            if tracer.arch.bits == 64:
+                self.handles.append(self.uc.hook_add(UC_HOOK_MEM_WRITE, tracer.arx_imports.observe,
+                                                    begin=tracer.image_start, end=tracer.image_end - 1))
             self.handles.append(self.uc.hook_add(UC_HOOK_INSN, tracer.on_syscall_instruction,
                                                 None, 1, 0, ux.UC_X86_INS_SYSCALL))
+            if tracer.arch.bits == 32:
+                self.handles.append(self.uc.hook_add(UC_HOOK_INSN, tracer.on_sysenter_instruction,
+                                                    None, 1, 0, ux.UC_X86_INS_SYSENTER))
             self.handles.append(self.uc.hook_add(UC_HOOK_INSN, tracer.on_cpuid_instruction,
                                                 None, 1, 0, ux.UC_X86_INS_CPUID))
             self.handles.append(self.uc.hook_add(UC_HOOK_MEM_INVALID, tracer.on_invalid_memory))
-            self.handles.append(self.uc.hook_add(UC_HOOK_INTR, tracer.single_step.interrupt))
+            self.handles.append(self.uc.hook_add(UC_HOOK_INTR, tracer.on_interrupt))
             if tracer.diagnostics is not None:
                 self.handles.append(self.uc.hook_add(UC_HOOK_MEM_READ, tracer.on_peb_read,
                                                     begin=peb_base, end=peb_base + page_size - 1))
@@ -43,16 +49,24 @@ class TraceHooks:
         tracer = self.tracer
 
         self.callbacks = (tracer.on_block, tracer.on_image_write)
-        points = ({tracer.entry_address} | tracer.stack_copy_candidates
+        points = ({tracer.entry_address}
                   | set(tracer.discovered_crc_loops)
                   | set(tracer.decompressors.candidates)
                   | {address for address in tracer.synthetic_import_targets if tracer.in_module(address)})
         self.context, context_address, block_address, write_address = _hook_filter.create(
             tracer.image_start, tracer.image_end,
             [(start, end) for start, end, _ in tracer.packed_destination_ranges],
-            sorted(points), sorted(tracer.synthetic_import_targets),
+            points, tracer.synthetic_import_targets,
             self.uc, *self.callbacks, ctypes.cast(binding.uclib.uc_emu_stop, ctypes.c_void_p).value,
             int(tracer.diagnostics is not None))
+        arch = tracer.arch
+        _hook_filter.configure_copies(
+            self.context, tracer.stack_copy_candidates,
+            ctypes.cast(binding.uclib.uc_reg_read, ctypes.c_void_p).value,
+            ctypes.cast(binding.uclib.uc_mem_read, ctypes.c_void_p).value,
+            arch.stack_base, arch.stack_base + arch.stack_size, arch.bits,
+            (arch.cx, arch.si, arch.di, ux.UC_X86_REG_EFLAGS, ux.UC_X86_REG_CS),
+        )
         tracer.block_counter = self.block_count
         self.add_native(UC_HOOK_BLOCK, block_address, context_address, 1, 0)
         self.add_native(UC_HOOK_MEM_WRITE, write_address, context_address,

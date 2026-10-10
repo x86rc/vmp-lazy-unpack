@@ -2,9 +2,10 @@ from collections import deque
 from copy import copy
 from dataclasses import dataclass, field
 
-from capstone import Cs, CS_ARCH_X86, CS_MODE_64
+from capstone import Cs, CS_ARCH_X86, CS_MODE_32, CS_MODE_64
 from capstone.x86 import X86_OP_IMM, X86_OP_MEM, X86_OP_REG
 
+from .arch import arch_of
 from .semantic_crc import ROOTS
 
 
@@ -112,11 +113,12 @@ class State:
 
 
 class LzmaMatcher:
-    def __init__(self, sections):
+    def __init__(self, sections, mode=CS_MODE_64):
         self.sections = sections
-        self.decoder = Cs(CS_ARCH_X86, CS_MODE_64)
+        self.decoder = Cs(CS_ARCH_X86, mode)
         self.decoder.detail = True
         self.instructions = {}
+        self.ptr = 4 if mode == CS_MODE_32 else 8
 
     def decode(self, address):
         if address not in self.instructions:
@@ -204,20 +206,20 @@ class LzmaMatcher:
     def step(self, state, ins):
         ops, name = ins.operands, ins.mnemonic
         if name == 'pushfq':
-            state.sp -= 8
-            state.stack[(state.sp, 8)] = ('flags', state.comparison)
+            state.sp -= self.ptr
+            state.stack[(state.sp, self.ptr)] = ('flags', state.comparison)
         elif name == 'popfq':
-            flags = state.stack.get((state.sp, 8))
+            flags = state.stack.get((state.sp, self.ptr))
             state.comparison = flags[1] if is_node(flags, 'flags') else None
-            state.sp += 8
+            state.sp += self.ptr
             return True
         elif name == 'push' and len(ops) == 1:
             value = self.read(state, ins, ops[0])
-            state.sp -= 8
-            state.stack[(state.sp, 8)] = value
+            state.sp -= self.ptr
+            state.stack[(state.sp, self.ptr)] = value
         elif name == 'pop' and len(ops) == 1:
-            value = state.stack.get((state.sp, 8), ('unknown', ins.address))
-            state.sp += 8
+            value = state.stack.get((state.sp, self.ptr), ('unknown', ins.address))
+            state.sp += self.ptr
             if not self.write(state, ins, ops[0], value): return False
         elif name in ('mov', 'movabs', 'movzx', 'movsx', 'movsxd') and len(ops) == 2:
             value = self.read(state, ins, ops[1])
@@ -279,14 +281,14 @@ class LzmaMatcher:
                     target = self.read(state, ins, ins.operands[0])
                     if not isinstance(target, int): break
                     if ins.mnemonic == 'call':
-                        state.sp -= 8
-                        state.stack[(state.sp, 8)] = next_pc
+                        state.sp -= self.ptr
+                        state.stack[(state.sp, self.ptr)] = next_pc
                     state.pc = target
                     continue
                 if ins.mnemonic == 'ret':
-                    target = state.stack.get((state.sp, 8))
+                    target = state.stack.get((state.sp, self.ptr))
                     if not isinstance(target, int): break
-                    state.sp += 8
+                    state.sp += self.ptr
                     state.pc = target
                     continue
                 if ins.mnemonic.startswith('j'):
@@ -343,7 +345,7 @@ def discover_lzma_candidates(pe):
     base = pe.OPTIONAL_HEADER.ImageBase
     sections = [(base + s.VirtualAddress, s.get_data()[:s.Misc_VirtualSize])
                 for s in pe.sections if s.Characteristics & 0x20000000]
-    matcher = LzmaMatcher(sections)
+    matcher = LzmaMatcher(sections, arch_of(pe).cs_mode)
     seeds = {}
     for address, data in sections:
         offset = 0

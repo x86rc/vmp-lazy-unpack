@@ -2,10 +2,10 @@ import argparse
 import json
 from pathlib import Path
 
-from .binary import write_u64
-from .catalog import Catalog
+from .arch import MODE64, for_pe, write_ptr
+from .catalog import Catalog, catalog_json_name, ensure_catalog_arch, ntdll_name
 from .discover import recover_keys
-from .encoded_imports import recover_encoded_imports
+from .decode_imports_xor import XorImportDecoder
 from .imports import import_slots, number
 from .pe import file_offset, memory_image, parse_pe
 from .reconstruct import reconstruct_imports
@@ -13,6 +13,7 @@ from .reconstruct import reconstruct_imports
 
 def resolve_static_imports(data, catalog, string_keys=None):
     pe = parse_pe(data)
+    arch = for_pe(pe)
     base = pe.OPTIONAL_HEADER.ImageBase
     keys = list(recover_keys(data) if string_keys is None else string_keys)
     if not keys:
@@ -25,9 +26,10 @@ def resolve_static_imports(data, catalog, string_keys=None):
             continue
         modules.add(name)
     modules = sorted(modules)
-    module_bases = {name: 0x7FFA00000000 + index * 0x200000 for index, name in enumerate(modules)}
-    recovered = recover_encoded_imports(memory_image(data), base, module_bases, catalog, keys,
-                                        require_initialized=False)
+    module_bases = {name: arch.emu_module_base + index * arch.emu_module_stride for index, name in enumerate(modules)}
+    decoder = XorImportDecoder(base, module_bases, catalog, keys, require_initialized=False,
+                               slot_size=arch.ptr)
+    recovered = decoder.recover(memory_image(data))
     if not recovered['imports']:
         raise ValueError('no iat found')
 
@@ -38,13 +40,13 @@ def resolve_static_imports(data, catalog, string_keys=None):
                 for byte in range(table['rva'], table['end_rva'])}
     for record in recovered['imports']:
         slot = record['slot_rva']
-        covered = set(range(slot, slot + 8))
+        covered = set(range(slot, slot + arch.ptr))
         if covered & (occupied | metadata):
             raise ValueError('import slots overlap each other or table metadata')
         occupied.update(covered)
-        offset = file_offset(pe, slot, 8)
-        value = (record['emu_address'] - record['key']) & 0xffffffffffffffff
-        write_u64(prepared, offset, value)
+        offset = file_offset(pe, slot, arch.ptr)
+        value = (record['emu_address'] - record['key']) & arch.mask
+        write_ptr(arch, prepared, offset, value)
         records.append({**record, 'encoded_value': value})
     bootstrap = [dict(slot_rva=slot, module=module, symbol=symbol)
                  for slot, (module, symbol) in import_slots(pe).items()]
@@ -93,11 +95,28 @@ def import_metadata(output, report):
     return imports
 
 
-def run_static_imports(input_path, output_path):
+def catalog_path_for(arch):
+    path = Path(__file__).resolve().parent.parent / "catalog"
+    missing = [name for name in (catalog_json_name(arch), ntdll_name(arch))
+               if not (path / name).is_file()]
+    if missing:
+        flag = " --32bit" if arch.bits == 32 else ""
+        raise ValueError(f"missing {' and '.join(missing)} in {path} run "
+                         f"python -m unpack.catalog{flag} on windows or copy the files there")
+    return path
+
+
+def run_static_imports(input_path, output_path, arch=MODE64):
     report_path = output_path.with_suffix(output_path.suffix + '.imports.json')
-    catalog_path = Path(__file__).resolve().parent.parent / 'catalog'
     data = input_path.read_bytes()
-    output, report = resolve_static_imports(data, Catalog(catalog_path))
+    actual = for_pe(parse_pe(data))
+    if actual.bits != arch.bits:
+        raise ValueError('binary is windows 64 bit remove --32bit'
+                         if actual.bits == 64 else
+                         'binary is windows 32 bit use --32bit')
+    catalog = Catalog(catalog_path_for(arch), arch)
+    ensure_catalog_arch(catalog, arch)
+    output, report = resolve_static_imports(data, catalog)
     imports = import_metadata(output, report)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_bytes(output)

@@ -28,10 +28,10 @@ def repair_exception_tables(data):
             return "start outside image sections"
         name = section.Name.rstrip(b'\0').decode('ascii', errors='replace')
         if not section.Characteristics & 0x20000000:
-            return f"section {name!r} not executable with characteristics 0x{section.Characteristics:X}"
+            return f"section {name!r} not executable flags 0x{section.Characteristics:X}"
         section_end = section.VirtualAddress + max(section.Misc_VirtualSize, section.SizeOfRawData)
         if end > section_end:
-            return f"end image offset 0x{end:X} exceeds section {name!r} ending at 0x{section_end:X}"
+            return f"end image offset 0x{end:X} exceeds section {name!r} end 0x{section_end:X}"
         return None
 
     def row(blob, offset=0, record_rva=None):
@@ -41,11 +41,11 @@ def repair_exception_tables(data):
         if reason is None and not unwind:
             reason = "unwind image offset zero"
         if reason is None and unwind % 4:
-            reason = f"unwind image offset 0x{unwind:X} not aligned to 4 bytes"
+            reason = f"unaligned unwind image offset 0x{unwind:X}"
         if reason:
             location = f" record image offset 0x{record_rva:X}" if record_rva is not None else ""
             raise ValueError(f"invalid runtime function at image offset 0x{begin:X} "
-                             f"end 0x{end:X} unwind 0x{unwind:X}{location} because {reason}")
+                             f"end 0x{end:X} unwind 0x{unwind:X}{location} {reason}")
         return result
 
     table = read(directory.VirtualAddress, directory.Size)
@@ -96,7 +96,7 @@ def repair_exception_tables(data):
                     reason = code_range_error(handler, handler + 1)
                     if reason:
                         raise ValueError(f"invalid exception handler image offset 0x{handler:X} "
-                                         f"unwind image offset 0x{unwind:X} because {reason}")
+                                         f"unwind image offset 0x{unwind:X} {reason}")
                     handler_section = pe.get_section_by_rva(tail)
                     protected.append((tail, handler_section.VirtualAddress + max(
                         handler_section.Misc_VirtualSize, handler_section.SizeOfRawData)))
@@ -168,6 +168,5 @@ def repair_exception_tables(data):
         output[offset:offset + size] = b"".join(encode_u32(value) for entry in native for value in entry)
         report.update(pdata_restored=len(native), pdata_status="restored_native_copy", pdata_rva=start)
     if output != data:
-        checked = parse_pe(bytes(output))
-        write_u32(output, checked.OPTIONAL_HEADER.get_field_absolute_offset("CheckSum"), checked.generate_checksum())
+        write_u32(output, pe.OPTIONAL_HEADER.get_field_absolute_offset("CheckSum"), 0)
     return bytes(output), report

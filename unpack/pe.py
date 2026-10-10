@@ -4,6 +4,7 @@ IMAGE_FILE_HEADER = pefile.PE.__IMAGE_FILE_HEADER_format__
 IMAGE_EXPORT_DIRECTORY = pefile.PE.__IMAGE_EXPORT_DIRECTORY_format__
 IMAGE_IMPORT_DESCRIPTOR = pefile.PE.__IMAGE_IMPORT_DESCRIPTOR_format__
 IMAGE_DATA_DIRECTORY = pefile.PE.__IMAGE_DATA_DIRECTORY_format__
+IMAGE_OPTIONAL_HEADER32 = pefile.PE.__IMAGE_OPTIONAL_HEADER_format__
 IMAGE_OPTIONAL_HEADER64 = pefile.PE.__IMAGE_OPTIONAL_HEADER64_format__
 IMAGE_SECTION_HEADER = pefile.PE.__IMAGE_SECTION_HEADER_format__
 
@@ -27,10 +28,16 @@ def align_up(value, alignment):
     return (value + alignment - 1) & -alignment
 
 
+def load_pe(data):
+    pe = pefile.PE(data=data, fast_load=True)
+    pe.full_load()
+    return pe
+
+
 def parse_pe(data):
-    pe = pefile.PE(data=data, fast_load=False)
-    if pe.FILE_HEADER.Machine != 0x8664 or pe.OPTIONAL_HEADER.Magic != 0x20B:
-        raise ValueError("only windows x64 supported")
+    pe = load_pe(data)
+    if (pe.FILE_HEADER.Machine, pe.OPTIONAL_HEADER.Magic) not in ((0x8664, 0x20B), (0x14C, 0x10B)):
+        raise ValueError("only supports windows pe")
     size = pe.OPTIONAL_HEADER.SizeOfImage
     if size <= 0:
         raise ValueError("invalid image size")

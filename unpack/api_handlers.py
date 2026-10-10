@@ -1,8 +1,10 @@
 import struct
+from importlib import import_module
 
 from unicorn import UC_PROT_WRITE, UcError
 import unicorn.x86_const as ux
 
+from .arch import MODE64, read_ptr
 from .binary import encode_u32, encode_u64, read_u16, read_u32, read_u64, write_u32, write_u64
 
 
@@ -35,12 +37,27 @@ def split_import_label(label):
 
 
 class ApiHandlers:
+    arch = MODE64
+    wow64 = False
+
+    def stack_slot(self, index):
+        sp = self.uc.reg_read(self.arch.sp)
+        if self.arch.bits == 64:
+            return read_u64(self.uc.mem_read(sp + 8 + index * 8, 8))
+        return read_u32(self.uc.mem_read(sp + 4 + index * 4, 4))
+
+    def read_ptr_mem(self, address):
+        return read_ptr(self.arch, self.uc.mem_read(address, self.arch.ptr))
+
     def memory_basic_information(self, address):
         page = address & -PAGE_SIZE
         if page >= 1 << 47:
             return None
         regions = list(self.uc.mem_regions())
         region = next((r for r in regions if r[0] <= page <= r[1]), None)
+        if self.arch.bits == 32:
+            api_handlers_32 = import_module('.32bit.api_handlers_32', __package__)
+            return api_handlers_32.memory_basic_information(self, page, region, regions)
         if region is None:
             end = min((r[0] for r in regions if r[0] > page), default=1 << 47)
             info = bytearray(48)
@@ -86,7 +103,12 @@ class ApiHandlers:
         length &= 0xFFFFFFFF
         details = dict(handle=handle, information_class=information_class,
                        output_address=hex(output), output_length=length)
-        if information_class == 0:
+        if self.arch.bits == 32:
+            api_handlers_32 = import_module('.32bit.api_handlers_32', __package__)
+            info = api_handlers_32.process_information_blob(self, information_class)
+            if info is None:
+                return None, details
+        elif information_class == 0:
             info = struct.pack('<I4xQQi4xQQ', 0x103, PEB_BASE, self.process_affinity_mask, 8, 0x1337, 0)
         elif information_class == 21:
             info = encode_u64(self.process_affinity_mask)
@@ -98,8 +120,7 @@ class ApiHandlers:
         if length and output & 3:
             return 0x80000002, details
         try:
-            rsp = self.uc.reg_read(ux.UC_X86_REG_RSP)
-            returned = read_u64(self.uc.mem_read(rsp + 0x28, 8))
+            returned = self.stack_slot(4)
         except UcError as exc:
             details['memory_error'] = str(exc)
             return 0xC0000005, details
@@ -109,8 +130,8 @@ class ApiHandlers:
             return 0xC0000005, details
         if length != required:
             return 0xC0000004, details
-        if handle != 0xFFFFFFFFFFFFFFFF:
-            if handle == 0xFFFFFFFFFFFFFFFE or handle in self.files.handles:
+        if handle != self.arch.mask:
+            if handle == self.arch.mask - 1 or handle in self.files.handles:
                 return 0xC0000024, details
             return 0xC0000008, details
         if not self.writable_range(output, required):
@@ -173,19 +194,31 @@ class ApiHandlers:
         self.write_u32_if_mapped(returned, return_length)
         return result, details
 
-    def emulate_import(self, label, *, argument_register=ux.UC_X86_REG_RCX):
+    def import_stack_bytes(self, label):
+        if self.arch.bits == 64:
+            return 0
+        symbol = self.import_symbol(label)
+        return 4 * self._handlers[symbol][1]
+
+    @staticmethod
+    def import_symbol(label):
         _, symbol = split_import_label(label)
         symbol = symbol.lower()
-        if symbol.startswith("zw"):
-            symbol = "nt" + symbol[2:]
-        handler = self._handlers.get(symbol)
-        if handler is None:
+        return "nt" + symbol[2:] if symbol.startswith("zw") else symbol
+
+    def emulate_import(self, label, *, argument_register=ux.UC_X86_REG_RCX):
+        symbol = self.import_symbol(label)
+        entry = self._handlers.get(symbol)
+        if entry is None:
             return None, {}
-        return handler(self, symbol,
-                       self.uc.reg_read(argument_register),
-                       self.uc.reg_read(ux.UC_X86_REG_RDX),
-                       self.uc.reg_read(ux.UC_X86_REG_R8),
-                       self.uc.reg_read(ux.UC_X86_REG_R9))
+        handler, argument_count = entry
+        if self.arch.bits == 32 or argument_register is None:
+            count = min(argument_count, 4)
+            args = [self.stack_slot(index) for index in range(count)] + [0] * (4 - count)
+        else:
+            args = [self.uc.reg_read(register) for register in
+                    (argument_register, ux.UC_X86_REG_RDX, ux.UC_X86_REG_R8, ux.UC_X86_REG_R9)]
+        return handler(self, symbol, *args)
 
     def _nt_set_information_thread(self, symbol, rcx, rdx, r8, r9):
         information_class = rdx & 0xFFFFFFFF
@@ -262,7 +295,7 @@ class ApiHandlers:
         return result, details
 
     def _get_process_heap(self, symbol, rcx, rdx, r8, r9):
-        return EMU_HEAP_BASE, {}
+        return self.arch.emu_heap_base, {}
 
     def _local_alloc(self, symbol, rcx, rdx, r8, r9):
         details = dict(allocation_size=rdx, allocation_flags=rcx & 0xFFFFFFFF)
@@ -302,7 +335,7 @@ class ApiHandlers:
         return result, details
 
     def _heap_size(self, symbol, rcx, rdx, r8, r9):
-        result = self.heap_allocations.get(r8, 0xFFFFFFFFFFFFFFFF)
+        result = self.heap_allocations.get(r8, self.arch.mask)
         return result, {}
 
     def _return_success(self, symbol, rcx, rdx, r8, r9):
@@ -320,9 +353,8 @@ class ApiHandlers:
 
     def _nt_protect_virtual_memory(self, symbol, rcx, rdx, r8, r9):
         details = {}
-        rsp = self.uc.reg_read(ux.UC_X86_REG_RSP)
         try:
-            old_protection = read_u64(self.uc.mem_read(rsp + 0x28, 8))
+            old_protection = self.stack_slot(4)
             self.write_u32_if_mapped(old_protection, 0x20)
         except UcError:
             return 0xC0000005, details
@@ -332,17 +364,17 @@ class ApiHandlers:
         details = dict(handle=rcx, information_class=rdx & 0xFFFFFFFF,
                        input_address=r8, input_length=r9 & 0xFFFFFFFF)
         if (rdx & 0xFFFFFFFF) == 21:
-            if (r9 & 0xFFFFFFFF) != 8:
+            if (r9 & 0xFFFFFFFF) != self.arch.ptr:
                 return 0xC0000004, details
-            if rcx != 0xFFFFFFFFFFFFFFFF:
+            if rcx != self.arch.mask:
                 return 0xC0000008, details
             try:
-                mask = read_u64(self.uc.mem_read(r8, 8))
+                mask = self.read_ptr_mem(r8)
             except UcError:
                 return 0xC0000005, details
             details['affinity_mask'] = hex(mask)
             return self.set_process_affinity(mask), details
-        if rcx != 0xFFFFFFFFFFFFFFFF or (rdx & 0xFFFFFFFF) != 0x28 or (r9 & 0xFFFFFFFF) != 16:
+        if rcx != self.arch.mask or (rdx & 0xFFFFFFFF) != 0x28 or (r9 & 0xFFFFFFFF) != 16:
             return None, details
         try:
             if bytes(self.uc.mem_read(r8, 16)) != bytes(16):
@@ -358,12 +390,11 @@ class ApiHandlers:
         details = dict(memory_address=rdx, information_class=r8 & 0xFFFFFFFF)
         if r8 & 0xFFFFFFFF:
             return None, details
-        rsp = self.uc.reg_read(ux.UC_X86_REG_RSP)
-        length = read_u64(self.uc.mem_read(rsp + 0x28, 8))
-        returned = read_u64(self.uc.mem_read(rsp + 0x30, 8))
-        if rcx != 0xFFFFFFFFFFFFFFFF:
+        length = self.stack_slot(4)
+        returned = self.stack_slot(5)
+        if rcx != self.arch.mask:
             result = 0xC0000008
-        elif length < 48:
+        elif length < (48 if self.arch.bits == 64 else 28):
             result = 0xC0000004
         else:
             info = self.memory_basic_information(rdx)
@@ -371,18 +402,18 @@ class ApiHandlers:
                 result = 0xC000000D
             else:
                 self.uc.mem_write(r9, info)
-                self.write_u64_if_mapped(returned, len(info))
+                self.write_ptr_if_mapped(returned, len(info))
                 result = 0
         return result, details
 
     def _nt_set_thread_affinity(self, symbol, rcx, rdx, r8, r9):
         details = dict(handle=rcx, information_class=4, input_address=r8, input_length=r9 & 0xFFFFFFFF)
-        if (r9 & 0xFFFFFFFF) != 8:
+        if (r9 & 0xFFFFFFFF) != self.arch.ptr:
             return 0xC0000004, details
-        if rcx != 0xFFFFFFFFFFFFFFFE:
+        if rcx != self.arch.mask - 1:
             return 0xC0000008, details
         try:
-            mask = read_u64(self.uc.mem_read(r8, 8))
+            mask = self.read_ptr_mem(r8)
         except UcError:
             return 0xC0000005, details
         details['affinity_mask'] = hex(mask)
@@ -392,7 +423,7 @@ class ApiHandlers:
         details = dict(handle=rcx, information_class=17, input_address=r8, input_length=r9)
         if (r9 & 0xFFFFFFFF) != 0:
             result = 0xC0000004
-        elif rcx != 0xFFFFFFFFFFFFFFFE:
+        elif rcx != self.arch.mask - 1:
             result = 0xC0000008
         else:
             self.thread_hidden_from_debugger = True
@@ -408,23 +439,24 @@ class ApiHandlers:
             result = 3221225480
         return result, details
 
+
     def _return_zero(self, symbol, rcx, rdx, r8, r9):
         return 0, {}
 
     def _nt_open_file(self, symbol, rcx, rdx, r8, r9):
         details = {}
         if r8:
-            object_name = read_u64(self.uc.mem_read(r8 + 16, 8))
+            object_name = self.read_ptr_mem(r8 + (16 if self.arch.bits == 64 else 8))
             if object_name:
                 length = read_u16(self.uc.mem_read(object_name, 2))
-                buffer = read_u64(self.uc.mem_read(object_name + 8, 8))
+                buffer = self.read_ptr_mem(object_name + (8 if self.arch.bits == 64 else 4))
                 details["requested_file"] = bytes(self.uc.mem_read(buffer, min(length, 4096))).decode("utf-16-le", errors="replace")
         handle = self.files.open(details.get("requested_file", ""))
         result = 0 if handle is not None else 0xC0000034
         if handle is not None:
-            self.write_u64_if_mapped(rcx, handle)
+            self.write_ptr_if_mapped(rcx, handle)
         if r9:
-            self.uc.mem_write(r9, struct.pack("<QQ", result, 0))
+            self.uc.mem_write(r9, struct.pack("<QQ" if self.arch.bits == 64 else "<II", result, 0))
         return result, details
 
     def _nt_raise_hard_error(self, symbol, rcx, rdx, r8, r9):
@@ -434,38 +466,33 @@ class ApiHandlers:
         details["unicode_parameters"] = []
         for index in range(min(rdx, 8)):
             if r8 & (1 << index):
-                descriptor = read_u64(self.uc.mem_read(r9 + index * 8, 8))
+                descriptor = self.read_ptr_mem(r9 + index * self.arch.ptr)
                 length = read_u16(self.uc.mem_read(descriptor, 2))
-                buffer = read_u64(self.uc.mem_read(descriptor + 8, 8))
+                buffer = self.read_ptr_mem(descriptor + (8 if self.arch.bits == 64 else 4))
                 details["unicode_parameters"].append(bytes(self.uc.mem_read(buffer, min(length, 16384))).decode("utf-16-le", errors="replace"))
         return None, details
 
     def _nt_create_section(self, symbol, rcx, rdx, r8, r9):
         details = {}
-        rsp = self.uc.reg_read(ux.UC_X86_REG_RSP)
-        attributes = read_u32(self.uc.mem_read(rsp + 0x30, 4))
-        file_handle = read_u64(self.uc.mem_read(rsp + 0x38, 8))
+        attributes = read_u32(self.uc.mem_read(self.uc.reg_read(self.arch.sp) + (0x30 if self.arch.bits == 64 else 0x18), 4))
+        file_handle = self.stack_slot(6)
         handle = self.files.section(file_handle, attributes)
         result = 0 if handle is not None else 0xC0000008
         if handle is not None:
-            self.write_u64_if_mapped(rcx, handle)
+            self.write_ptr_if_mapped(rcx, handle)
         details["section_attributes"] = attributes
         return result, details
 
     def _nt_map_view_of_section(self, symbol, rcx, rdx, r8, r9):
         details = {}
-        rsp = self.uc.reg_read(ux.UC_X86_REG_RSP)
-        def qword(address):
-            return read_u64(self.uc.mem_read(address, 8))
-        if qword(r8):
+        if self.read_ptr_mem(r8):
             raise ValueError("fixed address file views not supported")
-        offset_pointer = qword(rsp + 0x30)
-        size_pointer = qword(rsp + 0x38)
-        view, view_size = self.files.map(rcx, qword(offset_pointer) if offset_pointer else 0,
-                                         qword(size_pointer) if size_pointer else 0)
-        self.write_u64_if_mapped(r8, view)
-        self.write_u64_if_mapped(size_pointer, view_size)
-        details["view"] = view
+        offset_pointer = self.stack_slot(5)
+        size_pointer = self.stack_slot(6)
+        view, view_size = self.files.map(rcx, self.read_ptr_mem(offset_pointer) if offset_pointer else 0,
+                                         self.read_ptr_mem(size_pointer) if size_pointer else 0)
+        self.write_ptr_if_mapped(r8, view)
+        self.write_ptr_if_mapped(size_pointer, view_size)
         details.update(self.files.views[view])
         if self.diagnostics:
             self.diagnostics.watch_mapping(self.uc, view, view_size, self.files.views[view]['name'])
@@ -480,14 +507,18 @@ class ApiHandlers:
                        output_address=r8, output_length=r9)
 
         try:
-            rsp = self.uc.reg_read(ux.UC_X86_REG_RSP)
-            return_length = read_u64(self.uc.mem_read(rsp + 0x28, 8))
+            return_length = self.stack_slot(4)
             details["return_length_address"] = return_length
         except UcError as exc:
             details["return_length_address_error"] = str(exc)
             return 0xC0000005, details
         result = 0
-        if information_class == 0:
+        if self.arch.bits == 32:
+            api_handlers_32 = import_module('.32bit.api_handlers_32', __package__)
+            info = api_handlers_32.thread_information_blob(self, information_class)
+            if info is None:
+                return None, details
+        elif information_class == 0:
             info = struct.pack('<I4xQQQQii', 0x103, TEB_BASE, 0x1337, 0x7331,
                                self.thread_affinity_mask, 8, 8)
         elif information_class == 17:
@@ -496,7 +527,7 @@ class ApiHandlers:
             return None, details
         if (r9 & 0xFFFFFFFF) != len(info):
             result = 0xC0000004
-        elif rcx != 0xFFFFFFFFFFFFFFFE:
+        elif rcx != self.arch.mask - 1:
             result = 0xC0000008
         elif not self.writable_range(r8, len(info)) or (return_length and not self.writable_range(return_length, 4)):
             result = 0xC0000005
@@ -512,9 +543,13 @@ class ApiHandlers:
         if information_class == 0x4C:
             return self.query_firmware_information(rdx, r8, r9)
         elif information_class == 0:
-            info = struct.pack('<7I4xQQQB7x', 0, 156250, PAGE_SIZE, 0x200000,
-                               1, 0x200000, 0x10000, 0x10000, 0x7FFFFFFEFFFF,
-                               self.system_affinity_mask, self.system_affinity_mask.bit_count())
+            if self.arch.bits == 32:
+                api_handlers_32 = import_module('.32bit.api_handlers_32', __package__)
+                info = api_handlers_32.system_basic_information(self)
+            else:
+                info = struct.pack('<7I4xQQQB7x', 0, 156250, PAGE_SIZE, 0x200000,
+                                   1, 0x200000, 0x10000, 0x10000, 0x7FFFFFFEFFFF,
+                                   self.system_affinity_mask, self.system_affinity_mask.bit_count())
         elif information_class == 0x23:
             info = b"\x00\x01"
         elif information_class == 0x0B:
@@ -536,26 +571,38 @@ class ApiHandlers:
         return result, details
 
     def _get_current_process(self, symbol, rcx, rdx, r8, r9):
-        return 0xFFFFFFFFFFFFFFFF, {}
+        return self.arch.mask, {}
+
+
+
+    def _is_wow64_process(self, symbol, rcx, rdx, r8, r9):
+        if rcx != self.arch.mask:
+            self.last_error = 6
+            return 0, {}
+        if not self.writable_range(rdx, 4):
+            self.last_error = 998
+            return 0, {}
+        self.write_u32_if_mapped(rdx, int(self.wow64))
+        return 1, {}
 
     def _get_process_affinity_mask(self, symbol, rcx, rdx, r8, r9):
-        if rcx != 0xFFFFFFFFFFFFFFFF:
+        if rcx != self.arch.mask:
             self.last_error = 6
             result = 0
         elif not rdx or not r8:
             self.last_error = 87
             result = 0
         else:
-            self.write_u64_if_mapped(rdx, self.process_affinity_mask)
-            self.write_u64_if_mapped(r8, self.system_affinity_mask)
+            self.write_ptr_if_mapped(rdx, self.process_affinity_mask)
+            self.write_ptr_if_mapped(r8, self.system_affinity_mask)
             result = 1
         return result, {}
 
     def _get_current_thread(self, symbol, rcx, rdx, r8, r9):
-        return 0xFFFFFFFFFFFFFFFE, {}
+        return self.arch.mask - 1, {}
 
     def _set_affinity_mask(self, symbol, rcx, rdx, r8, r9):
-        handle = 0xFFFFFFFFFFFFFFFF if symbol == "setprocessaffinitymask" else 0xFFFFFFFFFFFFFFFE
+        handle = self.arch.mask if symbol == "setprocessaffinitymask" else self.arch.mask - 1
         if rcx != handle:
             self.last_error = 6
             result = 0
@@ -605,66 +652,68 @@ class ApiHandlers:
         return result, {}
 
     _handlers = {
-        'getversion': _get_version,
-        'rtlgetversion': _get_version_info,
-        'getversionexa': _get_version_info,
-        'getversionexw': _get_version_info,
-        'getmodulehandlea': _module_handle_a,
-        'loadlibrarya': _module_handle_a,
-        'getmodulehandlew': _module_handle_w,
-        'loadlibraryw': _module_handle_w,
-        'loadlibraryexw': _module_handle_w,
-        'getmodulefilenamew': _get_module_filename_w,
-        'getprocaddress': _get_proc_address,
-        'getprocessheap': _get_process_heap,
-        'localalloc': _local_alloc,
-        'localfree': _local_free,
-        'heapalloc': _heap_alloc,
-        'heaprealloc': _heap_realloc,
-        'heapsize': _heap_size,
-        'heapfree': _return_success,
-        'virtualfree': _return_success,
-        'freelibrary': _return_success,
-        'closehandle': _return_success,
-        'virtualalloc': _virtual_alloc,
-        'virtualprotect': _virtual_protect,
-        'ntprotectvirtualmemory': _nt_protect_virtual_memory,
-        'ntsetinformationprocess': _nt_set_information_process,
-        'ntqueryinformationprocess': _nt_query_information_process,
-        'ntqueryvirtualmemory': _nt_query_virtual_memory,
-        'ntsetinformationthread': _nt_set_information_thread,
-        'ntclose': _nt_close,
-        'ntdelayexecution': _return_zero,
-        'ntopenfile': _nt_open_file,
-        'ntraiseharderror': _nt_raise_hard_error,
-        'ntcreatesection': _nt_create_section,
-        'ntmapviewofsection': _nt_map_view_of_section,
-        'ntunmapviewofsection': _return_zero,
-        'ntopensection': _nt_open_section,
-        'ntqueryinformationthread': _nt_query_information_thread,
-        'ntquerysysteminformation': _nt_query_system_information,
-        'getcurrentprocess': _get_current_process,
-        'getprocessaffinitymask': _get_process_affinity_mask,
-        'getcurrentthread': _get_current_thread,
-        'setprocessaffinitymask': _set_affinity_mask,
-        'setthreadaffinitymask': _set_affinity_mask,
-        'getcurrentprocessid': _get_current_process_id,
-        'getcurrentthreadid': _get_current_thread_id,
-        'disablethreadlibrarycalls': _return_success,
-        'freeenvironmentstringsw': _return_success,
-        'queryperformancecounter': _query_performance_counter,
-        'gettickcount64': _get_tick_count64,
-        'sleep': _sleep,
-        'getsystemtimeasfiletime': _get_system_time_as_file_time,
-        'deletecriticalsection': _return_success,
-        'entercriticalsection': _return_success,
-        'leavecriticalsection': _return_success,
-        'initializecriticalsection': _return_success,
-        'initializecriticalsectionandspincount': _return_success,
-        'initializecriticalsectionex': _return_success,
-        'releasesrwlockexclusive': _return_success,
-        'acquiresrwlockexclusive': _return_success,
-        'setlasterror': _set_last_error,
-        'getlasterror': _get_last_error,
-        'isdebuggerpresent': _return_zero,
+        'getversion': (_get_version, 0),
+        'rtlgetversion': (_get_version_info, 1),
+        'getversionexa': (_get_version_info, 1),
+        'getversionexw': (_get_version_info, 1),
+        'getmodulehandlea': (_module_handle_a, 1),
+        'loadlibrarya': (_module_handle_a, 1),
+        'loadlibraryexa': (_module_handle_a, 3),
+        'getmodulehandlew': (_module_handle_w, 1),
+        'loadlibraryw': (_module_handle_w, 1),
+        'loadlibraryexw': (_module_handle_w, 3),
+        'getmodulefilenamew': (_get_module_filename_w, 3),
+        'getprocaddress': (_get_proc_address, 2),
+        'getprocessheap': (_get_process_heap, 0),
+        'localalloc': (_local_alloc, 2),
+        'localfree': (_local_free, 1),
+        'heapalloc': (_heap_alloc, 3),
+        'heaprealloc': (_heap_realloc, 4),
+        'heapsize': (_heap_size, 3),
+        'heapfree': (_return_success, 3),
+        'virtualfree': (_return_success, 3),
+        'freelibrary': (_return_success, 1),
+        'closehandle': (_return_success, 1),
+        'virtualalloc': (_virtual_alloc, 4),
+        'virtualprotect': (_virtual_protect, 4),
+        'ntprotectvirtualmemory': (_nt_protect_virtual_memory, 5),
+        'ntsetinformationprocess': (_nt_set_information_process, 4),
+        'ntqueryinformationprocess': (_nt_query_information_process, 5),
+        'ntqueryvirtualmemory': (_nt_query_virtual_memory, 6),
+        'ntsetinformationthread': (_nt_set_information_thread, 4),
+        'ntclose': (_nt_close, 1),
+        'ntdelayexecution': (_return_zero, 2),
+        'ntopenfile': (_nt_open_file, 6),
+        'ntraiseharderror': (_nt_raise_hard_error, 6),
+        'ntcreatesection': (_nt_create_section, 7),
+        'ntmapviewofsection': (_nt_map_view_of_section, 10),
+        'ntunmapviewofsection': (_return_zero, 2),
+        'ntopensection': (_nt_open_section, 3),
+        'ntqueryinformationthread': (_nt_query_information_thread, 5),
+        'ntquerysysteminformation': (_nt_query_system_information, 4),
+        'getcurrentprocess': (_get_current_process, 0),
+        'iswow64process': (_is_wow64_process, 2),
+        'getprocessaffinitymask': (_get_process_affinity_mask, 3),
+        'getcurrentthread': (_get_current_thread, 0),
+        'setprocessaffinitymask': (_set_affinity_mask, 2),
+        'setthreadaffinitymask': (_set_affinity_mask, 2),
+        'getcurrentprocessid': (_get_current_process_id, 0),
+        'getcurrentthreadid': (_get_current_thread_id, 0),
+        'disablethreadlibrarycalls': (_return_success, 1),
+        'freeenvironmentstringsw': (_return_success, 1),
+        'queryperformancecounter': (_query_performance_counter, 1),
+        'gettickcount64': (_get_tick_count64, 0),
+        'sleep': (_sleep, 1),
+        'getsystemtimeasfiletime': (_get_system_time_as_file_time, 1),
+        'deletecriticalsection': (_return_success, 1),
+        'entercriticalsection': (_return_success, 1),
+        'leavecriticalsection': (_return_success, 1),
+        'initializecriticalsection': (_return_success, 1),
+        'initializecriticalsectionandspincount': (_return_success, 2),
+        'initializecriticalsectionex': (_return_success, 3),
+        'releasesrwlockexclusive': (_return_success, 1),
+        'acquiresrwlockexclusive': (_return_success, 1),
+        'setlasterror': (_set_last_error, 1),
+        'getlasterror': (_get_last_error, 0),
+        'isdebuggerpresent': (_return_zero, 0),
     }

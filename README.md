@@ -1,6 +1,6 @@
 # vmp-lazy-unpack<br>[![@x86rc](https://img.shields.io/badge/%40x86rc-000000?style=flat&logo=x&logoColor=white)](https://x.com/x86rc)
 
-An emulation-based unpacker and import resolver for Windows x64 VMProtect 3.x binaries.
+An emulation-based unpacker and import resolver for Windows (x64, x32) VMProtect 3.x binaries.
 
 The project started as a script used to unpack VMProtect 3 in our devirtualization pipeline. It does this without the need to attach a debugger or dump live.
 
@@ -31,6 +31,12 @@ For normal unpacking + import fixups run:
 py -m unpack "C:\path\file.exe"
 ```
 
+For 32bit use:
+
+```powershell
+py -m unpack "C:\path\file.exe" --32bit
+```
+
 To fix imports on an already unpacked bin:
 
 ```powershell
@@ -39,7 +45,7 @@ py -m unpack "C:\path\file.bin" --imports_only
 
 ## Limitations
 
-- Only supports Windows x64. Tested against VMProtect 3.4, 3.9, and 3.10.
+- Only supports Windows x86. Tested against VMProtect 3.4, 3.9, 3.10, and 3.11.
 - This will not devirtualize code.
 - This will not resolve external calls inside virtualized functions automatically. These recovered imports are included in IAT for later lifting.
 

@@ -2,16 +2,18 @@ import json
 import time
 from collections import Counter, deque
 
-from capstone import Cs, CS_ARCH_X86, CS_MODE_64
+from capstone import Cs, CS_ARCH_X86
 
 from unicorn import UC_HOOK_MEM_READ, UC_HOOK_MEM_WRITE, UC_MEM_WRITE, UcError
 import unicorn.x86_const as ux
 
+from .arch import MODE64
 from .records import format_report
 
 
 class Diagnostics:
-    def __init__(self, directory, max_bytes=32 * 1024 * 1024):
+    def __init__(self, directory, max_bytes=32 * 1024 * 1024, arch=MODE64):
+        self.arch = arch
         self.directory = directory
         self.max_bytes = max_bytes
         self.bytes_written = 0
@@ -65,7 +67,7 @@ class Diagnostics:
         self.candidate_matches.clear()
 
     def ntdll_read(self, uc, mapping, location, size):
-        rip = uc.reg_read(ux.UC_X86_REG_RIP)
+        rip = uc.reg_read(self.arch.ip)
         matches = self.candidate_matches.get(rip)
         if matches is None:
             matches = [i for i, candidate in enumerate(self.candidates)
@@ -75,7 +77,7 @@ class Diagnostics:
         for index in matches:
             self.candidates[index]['ntdll_reads'] += 1
             self.candidates[index]['ntdll_bytes_read'] += size
-        rbp = uc.reg_read(ux.UC_X86_REG_RBP) if not matches else None
+        rbp = uc.reg_read(self.arch.bp) if not matches else None
         key = (mapping['base'], rip, rbp)
         reader = self.ntdll_readers.get(key)
         new_reader = reader is None
@@ -110,7 +112,7 @@ class Diagnostics:
         temporary.replace(self.directory / 'ntdll-reads.json')
 
     def hot_blocks(self, uc):
-        decoder = Cs(CS_ARCH_X86, CS_MODE_64)
+        decoder = Cs(CS_ARCH_X86, self.arch.cs_mode)
         blocks = []
         for address, hits in self.block_hits.most_common(64):
             size = self.block_sizes[address]
@@ -136,13 +138,13 @@ class Diagnostics:
             return None
 
     def snapshot(self, uc, extra_addresses=()):
-        names = ('rax', 'rbx', 'rcx', 'rdx', 'rsi', 'rdi', 'rbp', 'rsp',
-                 'r8', 'r9', 'r10', 'r11', 'r12', 'r13', 'r14', 'r15', 'rip', 'rflags')
-        registers = {name: uc.reg_read(getattr(ux, 'UC_X86_REG_' + name.upper())) for name in names}
+        registers = {name: uc.reg_read(register) for name, register in self.arch.gpr}
+        registers['rflags'] = uc.reg_read(ux.UC_X86_REG_EFLAGS)
         regions = list(uc.mem_regions())
         memory = []
         seen = set()
-        pointers = [(name, value, 512 if name in ('rsp', 'rsi') else 128)
+        stack_names = ('esp', 'esi') if self.arch.bits == 32 else ('rsp', 'rsi')
+        pointers = [(name, value, 512 if name in stack_names else 128)
                     for name, value in registers.items() if name != 'rflags']
         pointers += [(f'argument_{index + 1}', address, 128)
                      for index, address in enumerate(extra_addresses)]
@@ -161,13 +163,18 @@ class Diagnostics:
                 "memory": memory}
 
     def api_enter(self, uc, label, blocks):
-        arguments = [uc.reg_read(reg) for reg in
-                     (ux.UC_X86_REG_RCX, ux.UC_X86_REG_RDX, ux.UC_X86_REG_R8, ux.UC_X86_REG_R9)]
-        rsp = uc.reg_read(ux.UC_X86_REG_RSP)
-        for offset in range(0x28, 0x68, 8):
-            raw = self.read(uc, rsp + offset, 8)
+        rsp = uc.reg_read(self.arch.sp)
+        if self.arch.bits == 64:
+            arguments = [uc.reg_read(reg) for reg in
+                         (ux.UC_X86_REG_RCX, ux.UC_X86_REG_RDX, ux.UC_X86_REG_R8, ux.UC_X86_REG_R9)]
+            offsets = range(0x28, 0x68, 8)
+        else:
+            arguments = []
+            offsets = range(0x04, 0x44, 4)
+        for offset in offsets:
+            raw = self.read(uc, rsp + offset, self.arch.ptr)
             arguments.append(int.from_bytes(raw, 'little') if raw is not None else 0)
-        caller = self.read(uc, rsp, 8)
+        caller = self.read(uc, rsp, self.arch.ptr)
         self.record('api_enter', import_name=label, blocks=blocks,
                     return_address=int.from_bytes(caller, 'little') if caller else None,
                     argument_slots=[hex(value) for value in arguments],
@@ -197,11 +204,11 @@ class Diagnostics:
                 return
             raw = self.read(engine, location, min(width, 32))
             sample = {"access": field, "access_number": count,
-                      "rip": hex(engine.reg_read(ux.UC_X86_REG_RIP)),
+                      "rip": hex(engine.reg_read(self.arch.ip)),
                       "address": hex(location), "offset": hex(location - address),
                       "size": width, "bytes_before_access": raw.hex() if raw is not None else None}
             if access_type == UC_MEM_WRITE:
-                sample['write_value'] = hex(value & ((1 << 64) - 1))
+                sample['write_value'] = hex(value & self.arch.mask)
             state['samples'].append(sample)
             self.record('mapped_file_access', name=name, **sample)
 
