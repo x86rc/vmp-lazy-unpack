@@ -284,6 +284,25 @@ class ApiHandlers:
             details["module_path"] = path
         return result, details
 
+    def _get_module_filename_a(self, symbol, rcx, rdx, r8, r9):
+        details = {}
+        path = self.module_paths.get(rcx)
+        capacity = r8 & 0xFFFFFFFF
+        if not capacity:
+            result = 0
+        elif path is None:
+            self.last_error = 126
+            result = 0
+        else:
+            encoded = path.encode("ascii", errors="replace")
+            length = len(encoded)
+            self.uc.mem_write(rdx, encoded[:capacity - 1] + b"\x00")
+            result = length if length < capacity else capacity
+            if length >= capacity:
+                self.last_error = 122
+            details["module_path"] = path
+        return result, details
+
     def _get_proc_address(self, symbol, rcx, rdx, r8, r9):
         details = {}
         if rdx <= 0xFFFF:
@@ -337,6 +356,261 @@ class ApiHandlers:
     def _heap_size(self, symbol, rcx, rdx, r8, r9):
         result = self.heap_allocations.get(r8, self.arch.mask)
         return result, {}
+
+    def _heap_create(self, symbol, rcx, rdx, r8, r9):
+        return self.arch.emu_heap_base, {}
+
+    def _tls_alloc(self, symbol, rcx, rdx, r8, r9):
+        slots = getattr(self, "_tls_slots", None)
+        if slots is None:
+            slots = self._tls_slots = {}
+        index = len(slots)
+        slots[index] = 0
+        return index, {"tls_index": index}
+
+    def _tls_get_value(self, symbol, rcx, rdx, r8, r9):
+        return self._tls_slots.get(rcx, 0), {}
+
+    def _tls_set_value(self, symbol, rcx, rdx, r8, r9):
+        self._tls_slots[rcx] = rdx
+        return 1, {}
+
+    def _tls_free(self, symbol, rcx, rdx, r8, r9):
+        return 1, {}
+
+    def _fls_alloc(self, symbol, rcx, rdx, r8, r9):
+        slots = getattr(self, "_tls_slots", None)
+        if slots is None:
+            slots = self._tls_slots = {}
+        index = len(slots)
+        slots[index] = 0
+        return index, {"fls_index": index}
+
+    def _fls_get_value(self, symbol, rcx, rdx, r8, r9):
+        return self._tls_slots.get(rcx, 0), {}
+
+    def _fls_set_value(self, symbol, rcx, rdx, r8, r9):
+        self._tls_slots[rcx] = rdx
+        return 1, {}
+
+    def _fls_free(self, symbol, rcx, rdx, r8, r9):
+        return 1, {}
+
+    def _guest_u32(self, address):
+        try:
+            return int.from_bytes(self.uc.mem_read(address, 4), "little")
+        except UcError:
+            return 0
+
+    def _interlocked_increment(self, symbol, rcx, rdx, r8, r9):
+        value = (self._guest_u32(rcx) + 1) & 0xFFFFFFFF
+        self.write_u32_if_mapped(rcx, value)
+        return value, {}
+
+    def _interlocked_decrement(self, symbol, rcx, rdx, r8, r9):
+        value = (self._guest_u32(rcx) - 1) & 0xFFFFFFFF
+        self.write_u32_if_mapped(rcx, value)
+        return value, {}
+
+    def _interlocked_exchange(self, symbol, rcx, rdx, r8, r9):
+        old = self._guest_u32(rcx)
+        self.write_u32_if_mapped(rcx, rdx & 0xFFFFFFFF)
+        return old, {}
+
+    def _get_command_line(self, symbol, rcx, rdx, r8, r9):
+        text = "C:\\CageTools\\Examples_Code.vmp.exe"
+        data = text.encode("utf-16le") + b"\x00\x00" if symbol.endswith("w") else text.encode() + b"\x00"
+        buf = getattr(self, "_cmdline_buf", None)
+        if buf is None or buf[1] != data:
+            address = self.heap_allocate(len(data) + 16)
+            self.uc.mem_write(address, data)
+            buf = self._cmdline_buf = (address, data)
+        return buf[0] & self.arch.mask, {}
+
+    def _get_environment_strings_w(self, symbol, rcx, rdx, r8, r9):
+        buf = getattr(self, "_env_block", None)
+        if buf is None:
+            buf = self._env_block = self.heap_allocate(16)
+            self.uc.mem_write(buf, b"\x00\x00")
+        return buf & self.arch.mask, {}
+
+    def _wide_char_to_multi_byte(self, symbol, rcx, rdx, r8, r9):
+        cch = r9 & 0xFFFFFFFF
+        if cch == 0xFFFFFFFF:
+            raw = b""
+            for off in range(0, 8192, 512):
+                try:
+                    chunk = bytes(self.uc.mem_read(r8 + off, 1024))
+                except UcError:
+                    break
+                raw += chunk
+                if b"\x00\x00" in raw:
+                    break
+            raw = raw.split(b"\x00\x00")[0]
+        else:
+            try:
+                raw = bytes(self.uc.mem_read(r8, 2 * cch))
+            except UcError:
+                raw = b""
+        out = bytes(raw[i] & 0xFF for i in range(0, len(raw), 2))
+        multi_byte = self.stack_slot(4)
+        size = self.stack_slot(5)
+        used_default = self.stack_slot(7)
+        if size == 0:
+            return len(out) + (1 if cch == 0xFFFFFFFF else 0), {}
+        written = min(len(out), size)
+        try:
+            self.uc.mem_write(multi_byte, out[:written])
+        except UcError:
+            pass
+        self.write_u32_if_mapped(used_default, 0)
+        return written, {}
+
+    def _get_std_handle(self, symbol, rcx, rdx, r8, r9):
+        handles = {-10: 0x10, -11: 0x11, -12: 0x12, 0xFFFFFFF6: 0x10, 0xFFFFFFF5: 0x11, 0xFFFFFFF4: 0x12}
+        return handles.get(rcx & 0xFFFFFFFF if rcx < 0x80000000 else -((~rcx + 1) & 0xFFFFFFFF), 0), {}
+
+    def _get_file_type(self, symbol, rcx, rdx, r8, r9):
+        return 2, {}
+
+    def _set_file_pointer(self, symbol, rcx, rdx, r8, r9):
+        return 0, {}
+
+    def _flush_file_buffers(self, symbol, rcx, rdx, r8, r9):
+        return 1, {}
+
+    def _write_file(self, symbol, rcx, rdx, r8, r9):
+        written = self.stack_slot(4)
+        try:
+            data = bytes(self.uc.mem_read(rdx, r8 & 0xFFFFFFFF))
+        except UcError:
+            data = b""
+        import sys as _sys
+        _sys.stdout.buffer.write(data)
+        self.write_u32_if_mapped(written, len(data))
+        return 1, {"bytes": len(data)}
+
+    def _set_handle_count(self, symbol, rcx, rdx, r8, r9):
+        return rcx & 0xFFFFFFFF, {}
+
+    def _message_box(self, symbol, rcx, rdx, r8, r9):
+        return 1, {"result": "IDOK"}
+
+    def _get_acp(self, symbol, rcx, rdx, r8, r9):
+        return 1252, {}
+
+    def _get_oemcp(self, symbol, rcx, rdx, r8, r9):
+        return 437, {}
+
+    def _get_console_cp(self, symbol, rcx, rdx, r8, r9):
+        return 437, {}
+
+    def _get_cp_info(self, symbol, rcx, rdx, r8, r9):
+        import struct as _struct
+        max_char = 4 if (rcx & 0xFFFFFFFF) in (65001, 54936) else 1
+        info = _struct.pack("<I", max_char) + bytes([0x3F, 0x00]) + bytes(12)
+        try:
+            self.uc.mem_write(rdx, info)
+        except UcError:
+            return 0, {}
+        return 1, {}
+
+    def _get_string_type_w(self, symbol, rcx, rdx, r8, r9):
+        try:
+            self.uc.mem_write(r9, bytes(2 * (r8 & 0xFFFFFFFF)))
+        except UcError:
+            return 0, {}
+        return 1, {}
+
+    def _lc_map_string_w(self, symbol, rcx, rdx, r8, r9):
+        flags = rdx & 0xFFFFFFFF
+        src = r8
+        count = r9 & 0xFFFFFFFF
+        dest = self.stack_slot(4)
+        dest_count = self.stack_slot(5) & 0xFFFFFFFF
+        include_nul = False
+        if count == 0xFFFFFFFF or count == 0:
+            try:
+                raw = bytes(self.uc.mem_read(src, 4096))
+            except UcError:
+                return 0, {}
+            chars = raw.split(b'\x00\x00')[0]
+            units = [chars[i:i + 2] for i in range(0, len(chars), 2)]
+            count = len(units) + 1
+            include_nul = True
+        else:
+            try:
+                raw = bytes(self.uc.mem_read(src, 2 * count))
+            except UcError:
+                return 0, {}
+            units = [raw[i:i + 2] for i in range(0, len(raw), 2)]
+            if units and units[-1] == b'\x00\x00':
+                include_nul = True
+        if flags & 0x00000100:
+            units = [u.lower() for u in units]
+        elif flags & 0x00000200:
+            units = [u.upper() for u in units]
+        if dest == 0 or dest_count == 0:
+            return count, {}
+        out = b''.join(units)
+        write = out[:2 * dest_count]
+        try:
+            self.uc.mem_write(dest, write)
+        except UcError:
+            return 0, {}
+        return len(write) // 2, {}
+
+    def _is_processor_feature_present(self, symbol, rcx, rdx, r8, r9):
+        return 1, {}
+
+    def _get_user_default_ui_language(self, symbol, rcx, rdx, r8, r9):
+        return 1033, {}
+
+    def _is_valid_code_page(self, symbol, rcx, rdx, r8, r9):
+        return 1, {}
+
+    def _get_locale_info(self, symbol, rcx, rdx, r8, r9):
+        return 0, {}
+
+    def _multi_byte_to_wide_char(self, symbol, rcx, rdx, r8, r9):
+        count = r9 & 0xFFFFFFFF
+        if count == 0xFFFFFFFF:
+            try:
+                raw = bytes(self.uc.mem_read(r8, 4096)).split(b"\x00")[0]
+            except UcError:
+                raw = b""
+        else:
+            try:
+                raw = bytes(self.uc.mem_read(r8, count))
+            except UcError:
+                raw = b""
+        wide = b"".join(bytes((b, 0)) for b in raw)
+        dest = self.stack_slot(4)
+        size = self.stack_slot(5) & 0xFFFFFFFF
+        if dest == 0 or size == 0:
+            return len(raw), {}
+        written = min(len(raw), size)
+        try:
+            self.uc.mem_write(dest, wide[:2 * written])
+        except UcError:
+            return 0, {}
+        return written, {}
+
+    def _get_startup_info(self, symbol, rcx, rdx, r8, r9):
+        info = bytearray(68)
+        import struct as _struct
+        _struct.pack_into("<I", info, 0, 68)
+        try:
+            self.uc.mem_write(rcx, bytes(info))
+        except UcError:
+            pass
+        return 0, {}
+
+    def _encode_pointer(self, symbol, rcx, rdx, r8, r9):
+        return rcx, {"encoded": rcx}
+
+    def _decode_pointer(self, symbol, rcx, rdx, r8, r9):
+        return rcx, {"decoded": rcx}
 
     def _return_success(self, symbol, rcx, rdx, r8, r9):
         return 1, {}
@@ -717,6 +991,9 @@ class ApiHandlers:
     def _get_tick_count64(self, symbol, rcx, rdx, r8, r9):
         return 0x12345678, {}
 
+    def _get_tick_count(self, symbol, rcx, rdx, r8, r9):
+        return 0x12345678, {}
+
     def _sleep(self, symbol, rcx, rdx, r8, r9):
         details = {}
         details["milliseconds"] = rcx & 0xFFFFFFFF
@@ -748,11 +1025,55 @@ class ApiHandlers:
         'loadlibraryw': (_module_handle_w, 1),
         'loadlibraryexw': (_module_handle_w, 3),
         'getmodulefilenamew': (_get_module_filename_w, 3),
+        'getmodulefilenamea': (_get_module_filename_a, 3),
         'getprocaddress': (_get_proc_address, 2),
         'getprocessheap': (_get_process_heap, 0),
         'localalloc': (_local_alloc, 2),
         'localfree': (_local_free, 1),
         'heapalloc': (_heap_alloc, 3),
+        'heapcreate': (_heap_create, 3),
+        'heapdestroy': (_return_success, 1),
+        'tlsalloc': (_tls_alloc, 0),
+        'tlsgetvalue': (_tls_get_value, 1),
+        'tlssetvalue': (_tls_set_value, 2),
+        'tlsfree': (_tls_free, 1),
+        'flsalloc': (_fls_alloc, 1),
+        'flsgetvalue': (_fls_get_value, 1),
+        'flssetvalue': (_fls_set_value, 2),
+        'flsfree': (_fls_free, 1),
+        'interlockedincrement': (_interlocked_increment, 1),
+        'interlockeddecrement': (_interlocked_decrement, 1),
+        'interlockedexchange': (_interlocked_exchange, 2),
+        'getcommandlinea': (_get_command_line, 0),
+        'getcommandlinew': (_get_command_line, 0),
+        'getstartupinfoa': (_get_startup_info, 1),
+        'getstartupinfow': (_get_startup_info, 1),
+        'getenvironmentstringsw': (_get_environment_strings_w, 0),
+        'getenvironmentstrings': (_get_environment_strings_w, 0),
+        'widechartomultibyte': (_wide_char_to_multi_byte, 6),
+        'getstdhandle': (_get_std_handle, 1),
+        'getfiletype': (_get_file_type, 1),
+        'setfilepointer': (_set_file_pointer, 4),
+        'flushfilebuffers': (_flush_file_buffers, 1),
+        'writefile': (_write_file, 5),
+        'sethandlecount': (_set_handle_count, 1),
+        'messageboxa': (_message_box, 4),
+        'messageboxw': (_message_box, 4),
+        'getacp': (_get_acp, 0),
+        'getoemcp': (_get_oemcp, 0),
+        'getconsolecp': (_get_console_cp, 0),
+        'getconsoleoutputcp': (_get_console_cp, 0),
+        'getcpinfo': (_get_cp_info, 2),
+        'getstringtypew': (_get_string_type_w, 4),
+        'lcmapstringw': (_lc_map_string_w, 6),
+        'isprocessorfeaturepresent': (_is_processor_feature_present, 1),
+        'getuserdefaultuilanguage': (_get_user_default_ui_language, 0),
+        'isvalidcodepage': (_is_valid_code_page, 1),
+        'getlocaleinfoa': (_get_locale_info, 4),
+        'getlocaleinfow': (_get_locale_info, 4),
+        'multibytetowidechar': (_multi_byte_to_wide_char, 6),
+        'encodepointer': (_encode_pointer, 1),
+        'decodepointer': (_decode_pointer, 1),
         'heaprealloc': (_heap_realloc, 4),
         'heapsize': (_heap_size, 3),
         'heapfree': (_return_success, 3),
@@ -790,6 +1111,7 @@ class ApiHandlers:
         'freeenvironmentstringsw': (_return_success, 1),
         'queryperformancecounter': (_query_performance_counter, 1),
         'gettickcount64': (_get_tick_count64, 0),
+        'gettickcount': (_get_tick_count, 0),
         'sleep': (_sleep, 1),
         'getsystemtimeasfiletime': (_get_system_time_as_file_time, 1),
         'deletecriticalsection': (_return_success, 1),
